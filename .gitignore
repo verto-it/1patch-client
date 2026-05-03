@@ -1,5 +1,7 @@
+# Device identity contains a DPAPI-protected private key — must never be committed
+device.identity.json
+
+
+# Build output
 bin/
 obj/
-device.identity.json
-*.user
-*.log
