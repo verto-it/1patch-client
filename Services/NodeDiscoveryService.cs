@@ -1,7 +1,4 @@
 using System.Diagnostics;
-using System.Net.Http.Json;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -14,6 +11,7 @@ public sealed class NodeDiscoveryService
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ClientOptions _options;
+    private readonly SigningVerificationService _signing;
     private readonly ILogger<NodeDiscoveryService> _logger;
     private BackendNode? _stickyNode;
     // FIX #20: protect _stickyNode against concurrent access from heartbeat + task loops
@@ -22,10 +20,12 @@ public sealed class NodeDiscoveryService
     public NodeDiscoveryService(
         IHttpClientFactory httpClientFactory,
         IOptions<ClientOptions> options,
+        SigningVerificationService signing,
         ILogger<NodeDiscoveryService> logger)
     {
         _httpClientFactory = httpClientFactory;
         _options = options.Value;
+        _signing = signing;
         _logger = logger;
     }
 
@@ -42,14 +42,15 @@ public sealed class NodeDiscoveryService
 
             _logger.LogInformation("Fetching bootstrap manifest from {Url}", _options.ManagementUrl);
 
-            SignedManifest? manifest;
+            SignedEnvelope<BootstrapManifest>? manifest;
+            string raw;
             try
             {
                 var client = _httpClientFactory.CreateClient();
-                var raw = await client.GetStringAsync(
+                raw = await client.GetStringAsync(
                     $"{_options.ManagementUrl.TrimEnd('/')}/agent/bootstrap/{_options.TenantId}",
                     cancellationToken);
-                manifest = ParseSignedManifest(raw);
+                manifest = JsonSerializer.Deserialize<SignedEnvelope<BootstrapManifest>>(raw, JsonOptions);
             }
             catch (Exception ex)
             {
@@ -63,16 +64,20 @@ public sealed class NodeDiscoveryService
                 return null;
             }
 
-            // FIX #2: verify HMAC signature before trusting any node URLs
-            if (!VerifyManifestSignature(manifest))
+            BootstrapManifest payload;
+            try
             {
-                _logger.LogCritical("Bootstrap manifest signature verification FAILED — rejecting manifest (possible MITM)");
+                payload = _signing.VerifyJson<BootstrapManifest>(raw, "bootstrap_manifest");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "Bootstrap manifest signature verification FAILED — rejecting manifest");
                 return null;
             }
 
-            _logger.LogInformation("Manifest signature OK — probing {Count} candidate node(s)", manifest.Payload.Nodes.Length);
+            _logger.LogInformation("Manifest signature OK — probing {Count} candidate node(s)", payload.Nodes.Length);
 
-            var probes = await Task.WhenAll(manifest.Payload.Nodes.Select(n => ProbeAsync(n, cancellationToken)));
+            var probes = await Task.WhenAll(payload.Nodes.Select(n => ProbeAsync(n, cancellationToken)));
             _stickyNode = probes
                 .Where(p => p.Reachable)
                 .OrderBy(p => p.ElapsedMs)
@@ -80,7 +85,7 @@ public sealed class NodeDiscoveryService
                 .FirstOrDefault();
 
             if (_stickyNode is null)
-                _logger.LogWarning("No reachable backend nodes found from {Count} candidate(s)", manifest.Payload.Nodes.Length);
+                _logger.LogWarning("No reachable backend nodes found from {Count} candidate(s)", payload.Nodes.Length);
             else
                 _logger.LogInformation("Selected node {NodeId} ({Url}) — latency {Ms}ms",
                     _stickyNode.Id, _stickyNode.PublicUrl,
@@ -92,47 +97,6 @@ public sealed class NodeDiscoveryService
         {
             _lock.Release();
         }
-    }
-
-    private static SignedManifest? ParseSignedManifest(string raw)
-    {
-        using var doc = JsonDocument.Parse(raw);
-        var root = doc.RootElement;
-
-        if (!root.TryGetProperty("payload", out var payloadElement) ||
-            !root.TryGetProperty("signature", out var signatureElement))
-        {
-            return null;
-        }
-
-        var payloadJson = payloadElement.GetRawText();
-        var payload = payloadElement.Deserialize<ManifestPayload>(JsonOptions);
-        var signature = signatureElement.GetString();
-        var algorithm = root.TryGetProperty("algorithm", out var algorithmElement)
-            ? algorithmElement.GetString() ?? "HMAC-SHA256"
-            : "HMAC-SHA256";
-
-        return payload is null || string.IsNullOrWhiteSpace(signature)
-            ? null
-            : new SignedManifest(payload, payloadJson, signature, algorithm);
-    }
-
-    // FIX #2: HMAC-SHA256 manifest verification
-    private bool VerifyManifestSignature(SignedManifest manifest)
-    {
-        if (string.IsNullOrWhiteSpace(_options.ManifestSigningSecret))
-        {
-            _logger.LogError("ManifestSigningSecret is not configured — cannot verify bootstrap manifest");
-            return false;
-        }
-        var expected = Convert.ToHexString(
-            HMACSHA256.HashData(
-                Encoding.UTF8.GetBytes(_options.ManifestSigningSecret),
-                Encoding.UTF8.GetBytes(manifest.PayloadJson))).ToLowerInvariant();
-        // Constant-time comparison prevents timing attacks
-        return CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(expected),
-            Encoding.UTF8.GetBytes(manifest.Signature.ToLowerInvariant()));
     }
 
     private async Task<bool> IsReachableAsync(BackendNode node, CancellationToken ct)
@@ -158,6 +122,4 @@ public sealed class NodeDiscoveryService
     }
 
     private sealed record NodeProbe(BackendNode Node, bool Reachable, long ElapsedMs);
-    private sealed record SignedManifest(ManifestPayload Payload, string PayloadJson, string Signature, string Algorithm);
-    private sealed record ManifestPayload(string TenantId, DateTime IssuedAt, BackendNode[] Nodes);
 }

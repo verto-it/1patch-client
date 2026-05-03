@@ -42,7 +42,7 @@ public static class ClientConsoleSetup
     private static bool HasRequiredConfig(IConfiguration configuration)
         => !string.IsNullOrWhiteSpace(configuration["OnePatch:ManagementUrl"])
            && !string.IsNullOrWhiteSpace(configuration["OnePatch:EnrollmentToken"])
-           && !string.IsNullOrWhiteSpace(configuration["OnePatch:ManifestSigningSecret"]);
+           && configuration.GetSection("OnePatch:TrustedSigningPublicKeys").GetChildren().Any();
 
     private static async Task<JsonObject> PromptForConfigAsync()
     {
@@ -155,7 +155,8 @@ public static class ClientConsoleSetup
         => HasValue(config, "TenantId")
            && HasValue(config, "ManagementUrl")
            && HasValue(config, "EnrollmentToken")
-           && HasValue(config, "ManifestSigningSecret");
+           && config["TrustedSigningPublicKeys"] is JsonObject keys
+           && keys.Count > 0;
 
     private static bool HasValue(JsonObject config, string key)
         => !string.IsNullOrWhiteSpace(config[key]?.GetValue<string>());
@@ -170,7 +171,7 @@ public static class ClientConsoleSetup
             ["ManagementUrl"] = managementUrl,
             ["EnrollmentToken"] = Ask("Enrollment token", ""),
             ["ClientName"] = Ask("Client name override", ""),
-            ["ManifestSigningSecret"] = Ask("Manifest signing secret", ""),
+            ["TrustedSigningPublicKeys"] = new JsonObject { [Ask("Signing key ID", "main")] = Ask("Signing public key PEM", "") },
             ["TrustedDownloadHosts"] = new JsonArray(trusted.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(v => JsonValue.Create(v)).ToArray<JsonNode?>()),
             ["HeartbeatSeconds"] = ReadInt("Heartbeat seconds", 60),
             ["InventoryMinutes"] = ReadInt("Inventory minutes", 30),
@@ -196,6 +197,12 @@ public static class ClientConsoleSetup
             {
                 for (var i = 0; i < array.Count; i++)
                     configuration[$"OnePatch:{item.Key}:{i}"] = array[i]?.GetValue<string>();
+                continue;
+            }
+            if (item.Value is JsonObject obj)
+            {
+                foreach (var property in obj)
+                    configuration[$"OnePatch:{item.Key}:{property.Key}"] = property.Value?.GetValue<string>();
                 continue;
             }
             configuration[$"OnePatch:{item.Key}"] = item.Value?.ToString();

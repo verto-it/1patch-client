@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Text.Json;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -11,6 +12,7 @@ public sealed class BackendNodeClient
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly DeviceIdentityService _identity;
     private readonly NodeDiscoveryService _nodes;
+    private readonly SigningVerificationService _signing;
     private readonly ClientOptions _options;
     private readonly ILogger<BackendNodeClient> _logger;
 
@@ -18,12 +20,14 @@ public sealed class BackendNodeClient
         IHttpClientFactory httpClientFactory,
         DeviceIdentityService identity,
         NodeDiscoveryService nodes,
+        SigningVerificationService signing,
         IOptions<ClientOptions> options,
         ILogger<BackendNodeClient> logger)
     {
         _httpClientFactory = httpClientFactory;
         _identity = identity;
         _nodes = nodes;
+        _signing = signing;
         _options = options.Value;
         _logger = logger;
     }
@@ -118,10 +122,26 @@ public sealed class BackendNodeClient
             return [];
         }
 
-        var result = await response.Content.ReadFromJsonAsync<TaskEnvelope>(cancellationToken);
-        var tasks = result?.Tasks ?? [];
-        _logger.LogDebug("Received {Count} task(s) from node {NodeId}", tasks.Length, node.Id);
-        return tasks;
+        var raw = await response.Content.ReadAsStringAsync(cancellationToken);
+        using var doc = JsonDocument.Parse(raw);
+        var envelopes = doc.RootElement.TryGetProperty("tasks", out var taskElements) && taskElements.ValueKind == JsonValueKind.Array
+            ? taskElements.EnumerateArray().Select(element => element.GetRawText()).ToArray()
+            : [];
+        var tasks = new List<AgentTask>();
+        foreach (var envelope in envelopes)
+        {
+            try
+            {
+                var bundle = _signing.VerifyJson<TaskBundle>(envelope, "task_bundle");
+                tasks.AddRange(bundle.Tasks.Where(task => task.DeviceId == _identity.DeviceId));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "Rejected signed task bundle from node {NodeId}", node.Id);
+            }
+        }
+        _logger.LogDebug("Received {Count} task(s) from node {NodeId}", tasks.Count, node.Id);
+        return tasks.ToArray();
     }
 
     public async Task ReportTaskAsync(TaskResult result, CancellationToken cancellationToken)
@@ -152,5 +172,4 @@ public sealed class BackendNodeClient
             ?? throw new InvalidOperationException("No reachable 1Patch backend node found");
     }
 
-    private sealed record TaskEnvelope(AgentTask[] Tasks);
 }

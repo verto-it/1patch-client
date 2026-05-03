@@ -10,11 +10,7 @@ public sealed class ClientOptions
     public int InventoryMinutes { get; set; } = 30;
     public int NodeProbeTimeoutMilliseconds { get; set; } = 2000;
 
-    /// <summary>
-    /// HMAC-SHA256 secret used to verify the bootstrap manifest signature.
-    /// Must match SIGNING_SECRET on the management server. Required.
-    /// </summary>
-    public string ManifestSigningSecret { get; set; } = "";
+    public Dictionary<string, string> TrustedSigningPublicKeys { get; set; } = [];
 
     /// <summary>
     /// Allowlist of trusted https:// origins for package downloads.

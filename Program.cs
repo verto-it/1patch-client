@@ -10,6 +10,7 @@ await ClientConsoleSetup.EnsureConfiguredAsync(builder.Configuration);
 builder.Services.Configure<ClientOptions>(builder.Configuration.GetSection("OnePatch"));
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<DeviceIdentityService>();
+builder.Services.AddSingleton<SigningVerificationService>();
 builder.Services.AddSingleton<NodeDiscoveryService>();
 builder.Services.AddSingleton<BackendNodeClient>();
 builder.Services.AddSingleton<IPackageProvider, PlatformPackageProvider>();
@@ -27,11 +28,8 @@ if (string.IsNullOrWhiteSpace(opts.ManagementUrl))
 if (string.IsNullOrWhiteSpace(opts.EnrollmentToken))
     errors.Add("OnePatch:EnrollmentToken is required");
 
-if (string.IsNullOrWhiteSpace(opts.ManifestSigningSecret))
-    errors.Add("OnePatch:ManifestSigningSecret is required — must match SIGNING_SECRET on the management server");
-
-if (opts.ManifestSigningSecret is { Length: > 0 and < 32 })
-    errors.Add("OnePatch:ManifestSigningSecret must be at least 32 characters");
+if (opts.TrustedSigningPublicKeys.Count == 0)
+    errors.Add("OnePatch:TrustedSigningPublicKeys is required");
 
 if (errors.Count > 0)
 {

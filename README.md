@@ -20,7 +20,7 @@ C# .NET 8 worker service for Windows and Linux. Enrolls with the management serv
 
 ```powershell
 $enrollment = Invoke-RestMethod `
-  -Method Post "https://manage.1patch.local:4100/enrollments" `
+  -Method Post "https://manage.1patch.local:4100/devices/enrollments" `
   -Headers @{ "Authorization" = "Bearer <admin-jwt>" } `
   -ContentType "application/json" `
   -Body '{ "tenantId": "default", "mode": "batch", "maxUses": 100 }'
@@ -38,7 +38,9 @@ Edit `appsettings.json` on each client machine:
     "TenantId": "default",
     "ManagementUrl": "https://manage.1patch.local:4100",
     "EnrollmentToken": "<enrollmentToken from step 1>",
-    "ManifestSigningSecret": "<SIGNING_SECRET from management .env>",
+    "TrustedSigningPublicKeys": {
+      "main": "-----BEGIN PUBLIC KEY-----\\n...\\n-----END PUBLIC KEY-----"
+    },
     "TrustedDownloadHosts": [
       "https://manage.1patch.local:4100"
     ],
@@ -50,7 +52,7 @@ Edit `appsettings.json` on each client machine:
 }
 ```
 
-> `ManifestSigningSecret` must match `SIGNING_SECRET` in the management server `.env`. Without it the client rejects all bootstrap manifests and exits.
+> `TrustedSigningPublicKeys` pins the management public signing keys. The client rejects bootstrap manifests and task bundles signed by unknown keys.
 
 ### 3. Build and run
 
@@ -82,7 +84,7 @@ dotnet publish -c Release -r linux-x64 --self-contained -o ./publish/linux-x64
 | `TenantId` | yes | `default` | Tenant identifier — must match the enrollment |
 | `ManagementUrl` | yes | — | Base URL of the management server |
 | `EnrollmentToken` | yes | — | Token issued by the management server |
-| `ManifestSigningSecret` | yes | — | Must match `SIGNING_SECRET` on the management server (min 32 chars) |
+| `TrustedSigningPublicKeys` | yes | — | Key ID to P-256 public key PEM map for management signatures |
 | `TrustedDownloadHosts` | yes | — | Allowlist of HTTPS origins for package downloads |
 | `ClientName` | no | machine hostname | Override the display name for this device |
 | `HeartbeatSeconds` | no | `60` | How often to send a heartbeat to the backend node |
@@ -96,7 +98,7 @@ dotnet publish -c Release -r linux-x64 --self-contained -o ./publish/linux-x64
 The client exits immediately with a fatal error if any of the following are missing:
 - `ManagementUrl`
 - `EnrollmentToken`
-- `ManifestSigningSecret` (also rejected if shorter than 32 characters)
+- `TrustedSigningPublicKeys`
 
 ---
 
@@ -115,6 +117,7 @@ Start
        ├─ Inventory upload  (every InventoryMinutes)
        └─ Task poll         (every HeartbeatSeconds)
               └─ For each pending task:
+                   ├─ Verify signed task bundle and expiry
                    ├─ Verify task source URL is in TrustedDownloadHosts
                    ├─ Download package
                    ├─ Verify SHA-256 hash
@@ -137,6 +140,7 @@ The private key is never exposed through a public property or included in any lo
 ## Package Execution Security
 
 - Source URL must start with one of the configured `TrustedDownloadHosts`
+- Bootstrap manifests and task bundles must carry valid ES256 signatures from a pinned management key
 - SHA-256 hash is verified before execution
 - Only allowlisted task types are executed (`update_package`, `refresh_inventory`)
 - The client never executes arbitrary shell commands from the server

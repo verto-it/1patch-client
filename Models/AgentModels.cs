@@ -4,6 +4,7 @@ public sealed record BackendNode(string Id, string PublicUrl, string? Region, st
 public sealed record InstalledApp(string Name, string Publisher, string Version, string? ProductCode, string? PackageId);
 public sealed record AgentTask(
     string Id,
+    string DeviceId,
     string Type,
     string? AppName,
     string? PackageArtifactId,
@@ -14,3 +15,17 @@ public sealed record AgentTask(
     string? InstallArgs,
     string? TargetVersion);
 public sealed record TaskResult(string DeviceId, string TaskId, string Status, string? Output);
+
+public sealed record SignedEnvelope<T>(
+    string Algorithm,
+    string KeyId,
+    string PayloadType,
+    string TenantId,
+    string IssuedAt,
+    string ExpiresAt,
+    string Nonce,
+    T Payload,
+    string Signature);
+
+public sealed record BootstrapManifest(BackendNode[] Nodes);
+public sealed record TaskBundle(AgentTask[] Tasks);
