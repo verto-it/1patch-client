@@ -38,6 +38,8 @@ public sealed class SigningVerificationService
             DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
         if (!verified)
             throw new InvalidOperationException("Invalid signed payload signature");
+        if (envelope.PayloadHash is not null && !string.Equals(envelope.PayloadHash, ComputePayloadHash(envelope.Payload), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Signed payload hash mismatch");
         return envelope.Payload;
     }
 
@@ -54,6 +56,7 @@ public sealed class SigningVerificationService
             keyId = envelope.KeyId,
             nonce = envelope.Nonce,
             payload = envelope.Payload,
+            payloadHash = envelope.PayloadHash,
             payloadType = envelope.PayloadType,
             tenantId = envelope.TenantId,
         };
@@ -68,6 +71,8 @@ public sealed class SigningVerificationService
             DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
         if (!verified)
             throw new InvalidOperationException("Invalid signed payload signature");
+        if (envelope.PayloadHash is not null && !string.Equals(envelope.PayloadHash, ComputePayloadHash(envelope.Payload), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Signed payload hash mismatch");
 
         _logger.LogDebug("Verified signed payload type={PayloadType} keyId={KeyId}", envelope.PayloadType, envelope.KeyId);
         return envelope.Payload;
@@ -109,5 +114,12 @@ public sealed class SigningVerificationService
         var base64 = value.Replace('-', '+').Replace('_', '/');
         base64 = base64.PadRight(base64.Length + ((4 - base64.Length % 4) % 4), '=');
         return Convert.FromBase64String(base64);
+    }
+
+    private static string ComputePayloadHash<T>(T payload)
+    {
+        var json = JsonSerializer.Serialize(payload, JsonOptions);
+        var canonical = CanonicalJson(JsonDocument.Parse(json).RootElement);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
     }
 }

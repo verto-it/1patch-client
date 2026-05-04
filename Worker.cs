@@ -15,6 +15,7 @@ public sealed class Worker : BackgroundService
     private readonly DeviceIdentityService _identity;
     private readonly IPackageProvider _packages;
     private readonly TaskSecurityVerifier _security;
+    private readonly SigningVerificationService _signing;
     private readonly ClientOptions _options;
     private readonly ILogger<Worker> _logger;
 
@@ -23,6 +24,7 @@ public sealed class Worker : BackgroundService
         DeviceIdentityService identity,
         IPackageProvider packages,
         TaskSecurityVerifier security,
+        SigningVerificationService signing,
         IOptions<ClientOptions> options,
         ILogger<Worker> logger)
     {
@@ -30,6 +32,7 @@ public sealed class Worker : BackgroundService
         _identity = identity;
         _packages = packages;
         _security = security;
+        _signing  = signing;
         _options  = options.Value;
         _logger   = logger;
     }
@@ -84,6 +87,12 @@ public sealed class Worker : BackgroundService
 
     private async Task ExecuteTasksAsync(CancellationToken cancellationToken)
     {
+        if (await IsKillSwitchActiveAsync(cancellationToken))
+        {
+            _logger.LogCritical("Kill switch is active for tenant {TenantId}; skipping task execution cycle", _options.TenantId);
+            return;
+        }
+
         // GetTasksAsync now returns raw signed envelopes so we can verify them here
         IReadOnlyList<SignedEnvelope<TaskBundle>> envelopes;
         try
@@ -135,6 +144,15 @@ public sealed class Worker : BackgroundService
 
             foreach (var task in bundle.Tasks)
             {
+                if (await IsKillSwitchActiveAsync(cancellationToken))
+                {
+                    _logger.LogCritical("Kill switch activated before task {TaskId}; refusing execution", task.Id);
+                    await _backend.ReportTaskAsync(
+                        new TaskResult(_identity.DeviceId, task.Id, "rejected", "Kill switch active"),
+                        cancellationToken);
+                    continue;
+                }
+
                 _logger.LogInformation("Processing task {TaskId} type={Type} app={App}", task.Id, task.Type, task.AppName);
 
                 if (task.Type is not "update_package" and not "refresh_inventory")
@@ -177,5 +195,21 @@ public sealed class Worker : BackgroundService
         await _backend.UploadInventoryAsync(apps, cancellationToken);
         _logger.LogInformation("On-demand inventory refresh complete: {Count} app(s) uploaded", apps.Count);
         return $"Uploaded {apps.Count} installed apps";
+    }
+
+    private async Task<bool> IsKillSwitchActiveAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var envelope = await _backend.GetKillSwitchEnvelopeAsync(cancellationToken);
+            if (envelope is null) return false;
+            var state = _signing.Verify(envelope, "kill_switch");
+            return state.Active;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Kill switch status could not be verified; failing closed for this task cycle");
+            return true;
+        }
     }
 }

@@ -51,7 +51,7 @@ public sealed class DeviceIdentityService
         _logger.LogInformation("New device identity generated and stored. DeviceId={DeviceId}", DeviceId);
     }
 
-    /// <summary>Signs data with the device private key (for future mutual-auth flows).</summary>
+    /// <summary>Signs data with the device private key (SHA256withECDSA, DER format).</summary>
     public byte[] SignData(byte[] data)
     {
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
@@ -59,6 +59,18 @@ public sealed class DeviceIdentityService
         return key.SignData(data, HashAlgorithmName.SHA256);
     }
 
+
+    /// <summary>
+    /// Signs bytes with the device ES256 private key using IeeeP1363 fixed-field
+    /// concatenation (r||s, 64 bytes). Used by BackendNodeClient for per-request
+    /// device authentication headers (x-device-sig).
+    /// </summary>
+    public byte[] SignBytes(byte[] data)
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        key.ImportPkcs8PrivateKey(_privateKeyPkcs8, out _);
+        return key.SignData(data, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
+    }
     private static string GenerateHardwareId()
     {
         var raw = new DeviceIdBuilder()

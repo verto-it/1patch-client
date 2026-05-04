@@ -6,13 +6,24 @@ using Microsoft.Extensions.Options;
 using OnePatch.Client.Models;
 using OnePatch.Client.Services;
 
-
 namespace OnePatch.Client.Security;
 
 /// <summary>
-/// Enforces all client-side paranoia mode checks before a task is executed.
-/// This is the final gate — even if the backend node or management server is
+/// Enforces all client-side security checks before a task is executed.
+/// This is the final gate - even if the backend node or management server is
 /// compromised, a forged/hidden/modified/expired task is rejected here.
+///
+/// Zero-trust guarantees enforced in ALL security modes:
+///   - Valid ES256 signature from a pinned trusted key
+///   - Envelope not expired, correct payloadType and tenantId
+///   - Signed ledger entry present, state=active, visibleInDashboard=true, not expired
+///   - notBefore not in the future
+///   - taskHash matches ledger
+///   - HTTPS-only download URL for update_package tasks
+///
+/// Additional guarantees in Tinfoil only:
+///   - Minimum 2 approvals on the ledger entry
+///   - High-risk tasks require minimum 2 approvals
 /// </summary>
 public sealed class TaskSecurityVerifier
 {
@@ -34,13 +45,12 @@ public sealed class TaskSecurityVerifier
     {
         var mode = _options.SecurityMode;
 
-        // ── 1. Envelope-level checks (all modes) ─────────────────────────────
-
+        // 1. Envelope-level checks (all modes)
         if (!string.Equals(envelope.Algorithm, "ES256", StringComparison.Ordinal))
             Reject("Unsupported signature algorithm", envelope);
 
         if (!string.Equals(envelope.PayloadType, "task_bundle", StringComparison.Ordinal))
-            Reject($"Wrong payload type '{envelope.PayloadType}' — expected 'task_bundle'", envelope);
+            Reject($"Wrong payload type '{envelope.PayloadType}' - expected 'task_bundle'", envelope);
 
         if (!string.Equals(envelope.TenantId, _options.TenantId, StringComparison.Ordinal))
             Reject($"TenantId mismatch: envelope={envelope.TenantId} client={_options.TenantId}", envelope);
@@ -51,56 +61,50 @@ public sealed class TaskSecurityVerifier
         if (!DateTimeOffset.TryParse(envelope.ExpiresAt, out var expiresAt) || expiresAt <= DateTimeOffset.UtcNow)
             Reject("Signed envelope has expired", envelope);
 
-        // ── 2. Dev key rejection (strict + tinfoil) ───────────────────────────
+        // 2. Dev key rejection (all modes)
+        if (_options.DevKeyIds.Contains(envelope.KeyId))
+            Reject($"Dev signing key '{envelope.KeyId}' is not trusted for executable tasks", envelope);
 
-        if (mode >= SecurityMode.Strict && _options.DevKeyIds.Contains(envelope.KeyId))
-            Reject($"Dev signing key '{envelope.KeyId}' is not trusted in strict/tinfoil mode", envelope);
-
-        // ── 3. Verify ECDSA signature ─────────────────────────────────────────
-
+        // 3. Verify ECDSA signature
         VerifySignature(envelope);
 
-        // ── 4. Verify payloadHash if present ─────────────────────────────────
-
+        // 4. Verify payloadHash if present
         if (envelope.PayloadHash is not null)
         {
             var computedHash = ComputePayloadHash(envelope.Payload);
             if (!string.Equals(envelope.PayloadHash, computedHash, StringComparison.OrdinalIgnoreCase))
-                Reject("Payload hash mismatch — task bundle may have been tampered with", envelope);
+                Reject("Payload hash mismatch - task bundle may have been tampered with", envelope);
         }
 
         var bundle = envelope.Payload;
 
-        // ── 5. Ledger entry checks (strict + tinfoil) ─────────────────────────
+        // 5. Ledger entry checks (ALL modes)
+        // A signed, visible, active, non-expired ledger entry is required in every
+        // security mode. A task with no ledger, a hidden ledger, a revoked ledger,
+        // or an expired ledger must never execute - regardless of client config.
+        if (bundle.LedgerEntry is null)
+            Reject("No ledger entry present - task cannot be executed without a signed ledger", envelope);
 
-        if (mode >= SecurityMode.Strict)
-        {
-            if (bundle.LedgerEntry is null)
-                Reject("No ledger entry present — task cannot be executed in strict/tinfoil mode", envelope);
+        var ledger = bundle.LedgerEntry!;
 
-            var ledger = bundle.LedgerEntry!;
+        if (!string.Equals(ledger.State, "active", StringComparison.Ordinal))
+            Reject($"Ledger entry state is '{ledger.State}' - only 'active' entries are executable", envelope);
 
-            if (!string.Equals(ledger.State, "active", StringComparison.Ordinal))
-                Reject($"Ledger entry state is '{ledger.State}' — only 'active' entries are executable", envelope);
+        if (ledger.VisibleInDashboard != true)
+            Reject("Ledger entry visibleInDashboard is not true - hidden task injection attempt", envelope);
 
-            if (ledger.VisibleInDashboard != true)
-                Reject("Ledger entry visibleInDashboard is not true — hidden task injection attempt", envelope);
+        if (!DateTimeOffset.TryParse(ledger.ExpiresAt, out var ledgerExpiry) || ledgerExpiry <= DateTimeOffset.UtcNow)
+            Reject("Ledger entry has expired", envelope);
 
-            if (!DateTimeOffset.TryParse(ledger.ExpiresAt, out var ledgerExpiry) || ledgerExpiry <= DateTimeOffset.UtcNow)
-                Reject("Ledger entry has expired", envelope);
-        }
-
-        // ── 6. Per-task checks ────────────────────────────────────────────────
-
+        // 6. Per-task checks
         foreach (var task in bundle.Tasks)
             VerifyTask(task, bundle.LedgerEntry, mode);
 
-        // ── 7. Tinfoil: approval count ────────────────────────────────────────
-
-        if (mode == SecurityMode.Tinfoil && bundle.LedgerEntry is not null)
+        // 7. Tinfoil: approval count
+        if (mode == SecurityMode.Tinfoil)
         {
-            if (bundle.LedgerEntry.Approvals.Length < 2)
-                Reject($"Tinfoil mode requires at least 2 approvals — got {bundle.LedgerEntry.Approvals.Length}", envelope);
+            if (ledger.Approvals.Length < 2)
+                Reject($"Tinfoil mode requires at least 2 approvals - got {ledger.Approvals.Length}", envelope);
         }
 
         return bundle;
@@ -108,24 +112,22 @@ public sealed class TaskSecurityVerifier
 
     private void VerifyTask(AgentTask task, TaskLedgerEntry? ledger, SecurityMode mode)
     {
-        // ── notBefore delay (strict + tinfoil) ───────────────────────────────
-
-        if (mode >= SecurityMode.Strict && task.NotBefore is not null)
+        // notBefore (ALL modes) - enforced in every mode so the mandatory review
+        // delay cannot be bypassed regardless of client security configuration.
+        if (task.NotBefore is not null)
         {
             if (DateTimeOffset.TryParse(task.NotBefore, out var notBefore) && DateTimeOffset.UtcNow < notBefore)
                 Reject($"Task {task.Id} cannot be executed before {task.NotBefore}", task);
         }
 
-        // ── taskHash integrity against ledger ────────────────────────────────
-
-        if (mode >= SecurityMode.Strict && ledger is not null && task.TaskHash is not null)
+        // taskHash integrity (ALL modes)
+        if (ledger is not null && task.TaskHash is not null)
         {
             if (!string.Equals(ledger.TaskHash, task.TaskHash, StringComparison.OrdinalIgnoreCase))
-                Reject($"Task {task.Id} taskHash does not match ledger — task has been modified", task);
+                Reject($"Task {task.Id} taskHash does not match ledger - task has been modified", task);
         }
 
-        // ── Trusted source host (all modes for update_package) ───────────────
-
+        // Trusted source host (all modes, update_package)
         if (string.Equals(task.Type, "update_package", StringComparison.Ordinal))
         {
             if (string.IsNullOrEmpty(task.SourceUrl) || !task.SourceUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -139,8 +141,7 @@ public sealed class TaskSecurityVerifier
             }
         }
 
-        // ── Tinfoil: reject high/critical risk without ledger confirmation ────
-
+        // Tinfoil: high risk requires 2 approvals
         if (mode == SecurityMode.Tinfoil && ledger is not null)
         {
             if (ledger.RiskScore >= 70 && ledger.Approvals.Length < 2)
@@ -155,7 +156,6 @@ public sealed class TaskSecurityVerifier
         if (!_options.TrustedSigningPublicKeys.TryGetValue(envelope.KeyId, out var pemKey))
             Reject($"No public key for keyId '{envelope.KeyId}'", envelope);
 
-        // Reconstruct the canonical envelope without the signature field
         var unsigned = new
         {
             algorithm   = envelope.Algorithm,
@@ -177,8 +177,6 @@ public sealed class TaskSecurityVerifier
         if (!ecdsa.VerifyData(canonicalBytes, sig, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation))
             Reject($"Invalid ECDSA signature (keyId={envelope.KeyId})", envelope);
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static string ComputePayloadHash<T>(T payload)
     {

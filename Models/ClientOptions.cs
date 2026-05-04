@@ -24,15 +24,17 @@ public sealed class ClientOptions
 
     /// <summary>
     /// Client security mode.
-    /// Normal  – valid signature + hash + trusted host + expiry.
-    /// Strict  – + notBefore delay + MFA-approved ledger + security scan pass.
-    /// Tinfoil – + min 2 approvals + signed ledger + visibleInDashboard + kill-switch check + no high/critical risk.
+    /// Normal  - zero-trust baseline: signature/hash, pinned key, non-dev key,
+    ///           signed visible active ledger, notBefore/expiresAt, trusted host,
+    ///           and kill-switch polling.
+    /// Strict  - reserved for future stricter tenant-side posture.
+    /// Tinfoil - + min 2 approvals + no high/critical risk without 2 approvals.
     /// </summary>
     public SecurityMode SecurityMode { get; set; } = SecurityMode.Normal;
 
     /// <summary>
     /// Key IDs that are known to be dev-only.
-    /// Tasks signed with these keys are rejected when SecurityMode >= Strict.
+    /// Tasks signed with these keys are rejected in every mode.
     /// </summary>
     public List<string> DevKeyIds { get; set; } = [];
 
