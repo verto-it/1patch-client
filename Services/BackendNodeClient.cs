@@ -9,6 +9,7 @@ namespace OnePatch.Client.Services;
 
 public sealed class BackendNodeClient
 {
+    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly DeviceIdentityService _identity;
     private readonly NodeDiscoveryService _nodes;
@@ -45,22 +46,20 @@ public sealed class BackendNodeClient
             $"{node.PublicUrl.TrimEnd('/')}/agent/register",
             new
             {
-                deviceId = _identity.DeviceId,
-                tenantId = _options.TenantId,
+                deviceId       = _identity.DeviceId,
+                tenantId       = _options.TenantId,
                 hostname,
-                os = RuntimeInformation.OSDescription,
-                publicKey = _identity.PublicKey,
-                enrollmentToken = _options.EnrollmentToken
+                os             = RuntimeInformation.OSDescription,
+                publicKey      = _identity.PublicKey,
+                enrollmentToken = _options.EnrollmentToken,
             }, cancellationToken);
 
-        // FIX #19: always check the response status
         if (!response.IsSuccessStatusCode)
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogError("Registration failed: HTTP {Status} — {Body}", (int)response.StatusCode, body);
             response.EnsureSuccessStatusCode();
         }
-
         _logger.LogInformation("Device registration successful");
     }
 
@@ -78,11 +77,11 @@ public sealed class BackendNodeClient
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogWarning("Heartbeat rejected: HTTP {Status} — {Body}", (int)response.StatusCode, body);
-            // Heartbeat failure is non-fatal — log and continue
-            return;
         }
-
-        _logger.LogDebug("Heartbeat acknowledged by node {NodeId}", node.Id);
+        else
+        {
+            _logger.LogDebug("Heartbeat acknowledged by node {NodeId}", node.Id);
+        }
     }
 
     public async Task UploadInventoryAsync(IEnumerable<InstalledApp> apps, CancellationToken cancellationToken)
@@ -102,14 +101,18 @@ public sealed class BackendNodeClient
             _logger.LogError("Inventory upload failed: HTTP {Status} — {Body}", (int)response.StatusCode, body);
             response.EnsureSuccessStatusCode();
         }
-
         _logger.LogInformation("Inventory upload successful ({Count} apps)", appList.Count);
     }
 
-    public async Task<AgentTask[]> GetTasksAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Returns raw signed task bundle envelopes so the <c>TaskSecurityVerifier</c>
+    /// can inspect and verify them before any task fields are unwrapped.
+    /// The Worker calls this instead of the old GetTasksAsync.
+    /// </summary>
+    public async Task<IReadOnlyList<SignedEnvelope<TaskBundle>>> GetTaskEnvelopesAsync(CancellationToken cancellationToken)
     {
         var node = await RequireNodeAsync(cancellationToken);
-        _logger.LogDebug("Polling tasks from node {NodeId} for device {DeviceId}", node.Id, _identity.DeviceId);
+        _logger.LogDebug("Polling task envelopes from node {NodeId} for device {DeviceId}", node.Id, _identity.DeviceId);
 
         var response = await _httpClientFactory.CreateClient().GetAsync(
             $"{node.PublicUrl.TrimEnd('/')}/agent/tasks/{_identity.DeviceId}",
@@ -124,24 +127,41 @@ public sealed class BackendNodeClient
 
         var raw = await response.Content.ReadAsStringAsync(cancellationToken);
         using var doc = JsonDocument.Parse(raw);
-        var envelopes = doc.RootElement.TryGetProperty("tasks", out var taskElements) && taskElements.ValueKind == JsonValueKind.Array
-            ? taskElements.EnumerateArray().Select(element => element.GetRawText()).ToArray()
-            : [];
-        var tasks = new List<AgentTask>();
-        foreach (var envelope in envelopes)
+
+        if (!doc.RootElement.TryGetProperty("tasks", out var taskArray) ||
+            taskArray.ValueKind != JsonValueKind.Array)
+            return [];
+
+        var envelopes = new List<SignedEnvelope<TaskBundle>>();
+        foreach (var element in taskArray.EnumerateArray())
         {
+            SignedEnvelope<TaskBundle>? envelope = null;
             try
             {
-                var bundle = _signing.VerifyJson<TaskBundle>(envelope, "task_bundle");
-                tasks.AddRange(bundle.Tasks.Where(task => task.DeviceId == _identity.DeviceId));
+                // Deserialise the raw envelope — the security verifier will check the signature
+                envelope = JsonSerializer.Deserialize<SignedEnvelope<TaskBundle>>(element.GetRawText(), JsonOpts);
             }
             catch (Exception ex)
             {
-                _logger.LogCritical(ex, "Rejected signed task bundle from node {NodeId}", node.Id);
+                _logger.LogError(ex, "Failed to deserialise task envelope from node {NodeId} — skipping", node.Id);
+            }
+
+            if (envelope is not null &&
+                // Pre-filter: only accept task_bundle payloads for this device's tenant
+                string.Equals(envelope.PayloadType, "task_bundle", StringComparison.Ordinal) &&
+                string.Equals(envelope.TenantId, _options.TenantId, StringComparison.Ordinal))
+            {
+                envelopes.Add(envelope);
+            }
+            else if (envelope is not null)
+            {
+                _logger.LogWarning("Discarding envelope with unexpected payloadType={Type} tenantId={Tenant}",
+                    envelope.PayloadType, envelope.TenantId);
             }
         }
-        _logger.LogDebug("Received {Count} task(s) from node {NodeId}", tasks.Count, node.Id);
-        return tasks.ToArray();
+
+        _logger.LogDebug("Received {Count} task envelope(s) from node {NodeId}", envelopes.Count, node.Id);
+        return envelopes;
     }
 
     public async Task ReportTaskAsync(TaskResult result, CancellationToken cancellationToken)
@@ -171,5 +191,4 @@ public sealed class BackendNodeClient
         return await _nodes.GetBestNodeAsync(cancellationToken)
             ?? throw new InvalidOperationException("No reachable 1Patch backend node found");
     }
-
 }

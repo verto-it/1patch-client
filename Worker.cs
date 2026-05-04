@@ -3,15 +3,18 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OnePatch.Client.Models;
 using OnePatch.Client.Providers;
+using OnePatch.Client.Security;
 using OnePatch.Client.Services;
 
 namespace OnePatch.Client;
+
 
 public sealed class Worker : BackgroundService
 {
     private readonly BackendNodeClient _backend;
     private readonly DeviceIdentityService _identity;
     private readonly IPackageProvider _packages;
+    private readonly TaskSecurityVerifier _security;
     private readonly ClientOptions _options;
     private readonly ILogger<Worker> _logger;
 
@@ -19,20 +22,22 @@ public sealed class Worker : BackgroundService
         BackendNodeClient backend,
         DeviceIdentityService identity,
         IPackageProvider packages,
+        TaskSecurityVerifier security,
         IOptions<ClientOptions> options,
         ILogger<Worker> logger)
     {
-        _backend = backend;
+        _backend  = backend;
         _identity = identity;
         _packages = packages;
-        _options = options.Value;
-        _logger = logger;
+        _security = security;
+        _options  = options.Value;
+        _logger   = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("1Patch client starting. DeviceId={DeviceId} TenantId={TenantId} ManagementUrl={Url}",
-            _identity.DeviceId, _options.TenantId, _options.ManagementUrl);
+        _logger.LogInformation("1Patch client starting. DeviceId={DeviceId} TenantId={TenantId} ManagementUrl={Url} SecurityMode={Mode}",
+            _identity.DeviceId, _options.TenantId, _options.ManagementUrl, _options.SecurityMode);
 
         try
         {
@@ -48,23 +53,11 @@ public sealed class Worker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            try
-            {
-                await _backend.HeartbeatAsync(stoppingToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Heartbeat failed — will retry on next cycle");
-            }
+            try { await _backend.HeartbeatAsync(stoppingToken); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Heartbeat failed — will retry on next cycle"); }
 
-            try
-            {
-                await ExecuteTasksAsync(stoppingToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during task execution cycle");
-            }
+            try { await ExecuteTasksAsync(stoppingToken); }
+            catch (Exception ex) { _logger.LogError(ex, "Error during task execution cycle"); }
 
             if (DateTimeOffset.UtcNow >= nextInventoryAt)
             {
@@ -79,7 +72,7 @@ public sealed class Worker : BackgroundService
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Inventory scan/upload failed — will retry next cycle");
-                    nextInventoryAt = DateTimeOffset.UtcNow.AddMinutes(1); // short retry
+                    nextInventoryAt = DateTimeOffset.UtcNow.AddMinutes(1);
                 }
             }
 
@@ -91,61 +84,88 @@ public sealed class Worker : BackgroundService
 
     private async Task ExecuteTasksAsync(CancellationToken cancellationToken)
     {
-        AgentTask[] tasks;
+        // GetTasksAsync now returns raw signed envelopes so we can verify them here
+        IReadOnlyList<SignedEnvelope<TaskBundle>> envelopes;
         try
         {
-            tasks = await _backend.GetTasksAsync(cancellationToken);
+            envelopes = await _backend.GetTaskEnvelopesAsync(cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to poll tasks from backend node");
+            _logger.LogError(ex, "Failed to poll task envelopes from backend node");
             return;
         }
 
-        if (tasks.Length == 0)
+        if (envelopes.Count == 0)
         {
-            _logger.LogDebug("No pending tasks");
+            _logger.LogDebug("No pending task envelopes");
             return;
         }
 
-        _logger.LogInformation("Received {Count} task(s) to process", tasks.Length);
+        _logger.LogInformation("Received {Count} signed task envelope(s)", envelopes.Count);
 
-        foreach (var task in tasks)
+        foreach (var envelope in envelopes)
         {
-            _logger.LogInformation("Processing task {TaskId} type={Type} app={App}", task.Id, task.Type, task.AppName);
-
-            if (task.Type is not "update_package" and not "refresh_inventory")
+            // ── Security gate: verify before unwrapping ───────────────────────
+            TaskBundle bundle;
+            try
             {
-                _logger.LogWarning("Task {TaskId} has unknown type '{Type}' — rejecting", task.Id, task.Type);
-                await _backend.ReportTaskAsync(
-                    new TaskResult(_identity.DeviceId, task.Id, "rejected", "Unknown task type"),
-                    cancellationToken);
+                bundle = _security.VerifyBundle(envelope);
+            }
+            catch (TaskSecurityException ex)
+            {
+                _logger.LogError("Task envelope REJECTED by security gate: {Reason} (keyId={KeyId} tenantId={TenantId})",
+                    ex.Message, envelope.KeyId, envelope.TenantId);
+                // Report each task in the bundle as rejected
+                foreach (var t in envelope.Payload.Tasks)
+                {
+                    try
+                    {
+                        await _backend.ReportTaskAsync(
+                            new TaskResult(_identity.DeviceId, t.Id, "rejected", $"Security gate: {ex.Message}"),
+                            cancellationToken);
+                    }
+                    catch { /* best-effort */ }
+                }
                 continue;
             }
 
-            try
-            {
-                var output = task.Type == "refresh_inventory"
-                    ? await RefreshInventoryAsync(cancellationToken)
-                    : await _packages.UpdateAsync(task, cancellationToken);
+            _logger.LogDebug("Task envelope verified. ledgerId={LedgerId} tasks={Count}",
+                bundle.LedgerEntry?.LedgerId, bundle.Tasks.Length);
 
-                // The provider signals outcome via known prefixes — anything else means success.
-                var status = output.StartsWith("Task rejected", StringComparison.OrdinalIgnoreCase) ? "rejected"
-                    : output.StartsWith("Task failed", StringComparison.OrdinalIgnoreCase) ? "failed"
-                    : "completed";
-                _logger.LogInformation("Task {TaskId} finished with status={Status}. Output: {Output}",
-                    task.Id, status, output);
-
-                await _backend.ReportTaskAsync(
-                    new TaskResult(_identity.DeviceId, task.Id, status, output),
-                    cancellationToken);
-            }
-            catch (Exception ex)
+            foreach (var task in bundle.Tasks)
             {
-                _logger.LogError(ex, "Task {TaskId} threw an unhandled exception", task.Id);
-                await _backend.ReportTaskAsync(
-                    new TaskResult(_identity.DeviceId, task.Id, "failed", ex.Message),
-                    cancellationToken);
+                _logger.LogInformation("Processing task {TaskId} type={Type} app={App}", task.Id, task.Type, task.AppName);
+
+                if (task.Type is not "update_package" and not "refresh_inventory")
+                {
+                    _logger.LogWarning("Task {TaskId} has unknown type '{Type}' — rejecting", task.Id, task.Type);
+                    await _backend.ReportTaskAsync(
+                        new TaskResult(_identity.DeviceId, task.Id, "rejected", "Unknown task type"),
+                        cancellationToken);
+                    continue;
+                }
+
+                try
+                {
+                    var output = task.Type == "refresh_inventory"
+                        ? await RefreshInventoryAsync(cancellationToken)
+                        : await _packages.UpdateAsync(task, cancellationToken);
+
+                    var status = output.StartsWith("Task rejected", StringComparison.OrdinalIgnoreCase) ? "rejected"
+                        : output.StartsWith("Task failed",    StringComparison.OrdinalIgnoreCase) ? "failed"
+                        : "completed";
+
+                    _logger.LogInformation("Task {TaskId} finished status={Status}. Output: {Output}", task.Id, status, output);
+                    await _backend.ReportTaskAsync(new TaskResult(_identity.DeviceId, task.Id, status, output), cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Task {TaskId} threw an unhandled exception", task.Id);
+                    await _backend.ReportTaskAsync(
+                        new TaskResult(_identity.DeviceId, task.Id, "failed", ex.Message),
+                        cancellationToken);
+                }
             }
         }
     }
