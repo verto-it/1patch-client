@@ -4,31 +4,32 @@ using System.Text;
 using System.Text.Json;
 using DeviceId;
 using Microsoft.Extensions.Logging;
+using OnePatch.Client.Providers;
 
 namespace OnePatch.Client.Services;
 
 public sealed class DeviceIdentityService
 {
-    private static readonly string StorePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "1Patch", "device.identity.json");
-
     public string DeviceId { get; }
     public string PublicKey { get; }
 
     // Private key bytes held in memory only — never exposed as a public property
     private readonly byte[] _privateKeyPkcs8;
     private readonly ILogger<DeviceIdentityService> _logger;
+    private readonly IPlatformInfo _platform;
+    private readonly string _storePath;
 
-    public DeviceIdentityService(ILogger<DeviceIdentityService> logger)
+    public DeviceIdentityService(IPlatformInfo platform, ILogger<DeviceIdentityService> logger)
     {
+        _platform = platform;
         _logger = logger;
-        Directory.CreateDirectory(Path.GetDirectoryName(StorePath)!);
+        _storePath = GetStorePath(platform);
+        Directory.CreateDirectory(Path.GetDirectoryName(_storePath)!);
 
-        if (File.Exists(StorePath))
+        if (File.Exists(_storePath) && !IsDevelopment())
         {
-            _logger.LogInformation("Loading device identity from {Path}", StorePath);
-            var stored = JsonSerializer.Deserialize<StoredIdentity>(File.ReadAllText(StorePath))!;
+            _logger.LogInformation("Loading device identity from {Path}", _storePath);
+            var stored = JsonSerializer.Deserialize<StoredIdentity>(File.ReadAllText(_storePath))!;
             DeviceId = stored.DeviceId;
             PublicKey = stored.PublicKey;
             _privateKeyPkcs8 = UnprotectKey(stored.ProtectedPrivateKey);
@@ -36,17 +37,20 @@ public sealed class DeviceIdentityService
             return;
         }
 
+        if (IsDevelopment() && File.Exists(_storePath))
+            _logger.LogInformation("Development mode — regenerating device identity (ephemeral server keys require fresh registration each startup)");
+
         _logger.LogInformation("No existing device identity — generating new identity");
         DeviceId = GenerateHardwareId();
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         PublicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
         _privateKeyPkcs8 = key.ExportPkcs8PrivateKey();
 
-        File.WriteAllText(StorePath, JsonSerializer.Serialize(
+        File.WriteAllText(_storePath, JsonSerializer.Serialize(
             new StoredIdentity(DeviceId, PublicKey, ProtectKey(_privateKeyPkcs8))));
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-            File.SetUnixFileMode(StorePath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        if (_platform.IsLinux && OperatingSystem.IsLinux())
+            File.SetUnixFileMode(_storePath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
         _logger.LogInformation("New device identity generated and stored. DeviceId={DeviceId}", DeviceId);
     }
@@ -97,6 +101,18 @@ public sealed class DeviceIdentityService
             return ProtectedData.Unprotect(data, null, DataProtectionScope.LocalMachine);
         return data;
     }
+
+    private static string GetStorePath(IPlatformInfo platform)
+    {
+        if (platform.IsLinux)
+            return Path.Combine("/var/lib/1patch", "device.identity.json");
+
+        return Path.Combine(platform.CommonApplicationDataPath, "1Patch", "device.identity.json");
+    }
+
+    private static bool IsDevelopment()
+        => string.Equals(Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase);
 
     private sealed record StoredIdentity(string DeviceId, string PublicKey, string ProtectedPrivateKey);
 }

@@ -42,7 +42,8 @@ public static class ClientConsoleSetup
     private static bool HasRequiredConfig(IConfiguration configuration)
         => !string.IsNullOrWhiteSpace(configuration["OnePatch:ManagementUrl"])
            && !string.IsNullOrWhiteSpace(configuration["OnePatch:EnrollmentToken"])
-           && configuration.GetSection("OnePatch:TrustedSigningPublicKeys").GetChildren().Any();
+           && (configuration.GetSection("OnePatch:TrustedSigningKeys").GetChildren().Any()
+               || IsDevelopment() && configuration.GetSection("OnePatch:TrustedSigningPublicKeys").GetChildren().Any());
 
     private static async Task<JsonObject> PromptForConfigAsync()
     {
@@ -155,8 +156,8 @@ public static class ClientConsoleSetup
         => HasValue(config, "TenantId")
            && HasValue(config, "ManagementUrl")
            && HasValue(config, "EnrollmentToken")
-           && config["TrustedSigningPublicKeys"] is JsonObject keys
-           && keys.Count > 0;
+           && ((config["TrustedSigningKeys"] is JsonObject keys && keys.Count > 0)
+               || IsDevelopment() && config["TrustedSigningPublicKeys"] is JsonObject legacyKeys && legacyKeys.Count > 0);
 
     private static bool HasValue(JsonObject config, string key)
         => !string.IsNullOrWhiteSpace(config[key]?.GetValue<string>());
@@ -171,7 +172,19 @@ public static class ClientConsoleSetup
             ["ManagementUrl"] = managementUrl,
             ["EnrollmentToken"] = Ask("Enrollment token", ""),
             ["ClientName"] = Ask("Client name override", ""),
-            ["TrustedSigningPublicKeys"] = new JsonObject { [Ask("Signing key ID", "main")] = Ask("Signing public key PEM", "") },
+            ["TrustedSigningKeys"] = new JsonObject
+            {
+                [Ask("Signing key ID", "key_task_bundle_v1")] = new JsonObject
+                {
+                    ["keyId"] = Ask("Signing key ID again", "key_task_bundle_v1"),
+                    ["scope"] = Ask("Signing key scope", "task_bundle"),
+                    ["status"] = "active",
+                    ["publicKeyPem"] = Ask("Signing public key PEM", ""),
+                    ["issuedAt"] = DateTimeOffset.UtcNow.ToString("O"),
+                    ["isDev"] = false,
+                    ["algorithm"] = "ES256",
+                },
+            },
             ["TrustedDownloadHosts"] = new JsonArray(trusted.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(v => JsonValue.Create(v)).ToArray<JsonNode?>()),
             ["HeartbeatSeconds"] = ReadInt("Heartbeat seconds", 60),
             ["InventoryMinutes"] = ReadInt("Inventory minutes", 30),
@@ -188,6 +201,10 @@ public static class ClientConsoleSetup
 
     private static int ReadInt(string label, int fallback)
         => int.TryParse(Ask(label, fallback.ToString()), out var value) && value > 0 ? value : fallback;
+
+    private static bool IsDevelopment()
+        => string.Equals(Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase);
 
     private static void Apply(IConfiguration configuration, JsonObject onePatch)
     {

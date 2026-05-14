@@ -1,7 +1,5 @@
-using System.Diagnostics;
+using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
-using System.Runtime.InteropServices;
-using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
@@ -18,31 +16,37 @@ public sealed class PlatformPackageProvider : IPackageProvider
     private readonly ClientOptions _options;
     private readonly ILogger<PlatformPackageProvider> _logger;
     private readonly NodeDiscoveryService _nodes;
+    private readonly IPlatformInfo _platform;
+    private readonly IProcessRunner _processRunner;
 
     // Package names are passed as ProcessStartInfo.ArgumentList entries, never through a shell.
     private static readonly Regex SafePackageIdPattern = new(@"^[A-Za-z0-9._\-]+$", RegexOptions.Compiled);
-    private static readonly Regex SafeAptPackagePattern = new(@"^[a-z0-9][a-z0-9+.\-]*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex SafeAptPackagePattern = new(@"^[a-z0-9][a-z0-9+.\-]*$", RegexOptions.Compiled);
 
     public PlatformPackageProvider(
         IHttpClientFactory httpClientFactory,
         IOptions<ClientOptions> options,
         NodeDiscoveryService nodes,
+        IPlatformInfo platform,
+        IProcessRunner processRunner,
         ILogger<PlatformPackageProvider> logger)
     {
         _httpClientFactory = httpClientFactory;
         _options = options.Value;
         _nodes = nodes;
+        _platform = platform;
+        _processRunner = processRunner;
         _logger = logger;
     }
 
     public Task<IReadOnlyList<InstalledApp>> GetInstalledAppsAsync(CancellationToken cancellationToken)
     {
-        if (IsWindows())
+        if (_platform.IsWindows)
         {
             _logger.LogInformation("Enumerating installed Windows applications");
             return GetWindowsAppsAsync(cancellationToken);
         }
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        if (_platform.IsLinux)
         {
             _logger.LogInformation("Enumerating installed Linux (dpkg) applications");
             return GetLinuxAppsAsync(cancellationToken);
@@ -56,10 +60,18 @@ public sealed class PlatformPackageProvider : IPackageProvider
     {
         var apps = GetWindowsRegistryApps();
         var wingetIds = await TryBuildWingetIdMapAsync(cancellationToken);
-        if (wingetIds.Count == 0) return apps;
-        return apps
-            .Select(a => wingetIds.TryGetValue(a.Name, out var id) ? a with { PackageId = id } : a)
-            .ToList();
+        if (wingetIds.Count > 0)
+        {
+            apps = apps
+                .Select(a => wingetIds.TryGetValue(a.Name, out var id)
+                    ? a with { PackageId = id, PackageManager = "winget", PackageScope = "system" }
+                    : a)
+                .ToList();
+        }
+
+        apps.AddRange(await TryGetChocolateyAppsAsync(cancellationToken));
+        apps.AddRange(GetScoopApps());
+        return apps;
     }
 
     private async Task<Dictionary<string, string>> TryBuildWingetIdMapAsync(CancellationToken cancellationToken)
@@ -80,7 +92,7 @@ public sealed class PlatformPackageProvider : IPackageProvider
         return map;
     }
 
-    private static void ParseWingetListInto(string output, Dictionary<string, string> map)
+    public static void ParseWingetListInto(string output, Dictionary<string, string> map)
     {
         var lines = output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
 
@@ -118,42 +130,242 @@ public sealed class PlatformPackageProvider : IPackageProvider
         }
     }
 
+    public static IReadOnlyList<InstalledApp> ParseChocolateyList(string output)
+    {
+        return output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => line.Split('|', 2, StringSplitOptions.TrimEntries))
+            .Where(parts => parts.Length == 2 && SafePackageIdPattern.IsMatch(parts[0]))
+            .Select(parts => new InstalledApp(parts[0], "Chocolatey", parts[1], null, parts[0], "chocolatey", "system"))
+            .ToList();
+    }
+
+    private async Task<IReadOnlyList<InstalledApp>> TryGetChocolateyAppsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var output = await RunAsync("choco", ["list", "--limit-output"], cancellationToken);
+            var apps = ParseChocolateyList(output);
+            _logger.LogInformation("Chocolatey inventory resolved {Count} package(s)", apps.Count);
+            return apps;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Chocolatey inventory skipped because choco was unavailable or failed");
+            return [];
+        }
+    }
+
+    private IReadOnlyList<InstalledApp> GetScoopApps()
+    {
+        var roots = new List<(string AppsPath, string Scope)>();
+        AddScoopRoot(roots, Path.Combine(_platform.CommonApplicationDataPath, "scoop", "apps"), "global");
+        AddScoopRoot(roots, Path.Combine(Environment.GetEnvironmentVariable("SCOOP_GLOBAL") ?? "", "apps"), "global");
+        AddScoopRoot(roots, Path.Combine(Environment.GetEnvironmentVariable("SCOOP") ?? "", "apps"), "system");
+
+        var currentProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        AddScoopRoot(roots, Path.Combine(currentProfile, "scoop", "apps"), "system");
+
+        var usersRoot = Directory.GetParent(currentProfile)?.FullName;
+        if (!string.IsNullOrWhiteSpace(usersRoot) && Directory.Exists(usersRoot))
+        {
+            try
+            {
+                foreach (var profile in Directory.EnumerateDirectories(usersRoot))
+                    AddScoopRoot(roots, Path.Combine(profile, "scoop", "apps"), "user");
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogDebug(ex, "Some user profile Scoop roots could not be scanned");
+            }
+            catch (IOException ex)
+            {
+                _logger.LogDebug(ex, "Some user profile Scoop roots could not be scanned");
+            }
+        }
+
+        var apps = ScanScoopAppsFromRoots(roots);
+        _logger.LogInformation("Scoop inventory resolved {Count} package(s)", apps.Count);
+        return apps;
+    }
+
+    private static void AddScoopRoot(List<(string AppsPath, string Scope)> roots, string appsPath, string scope)
+    {
+        if (string.IsNullOrWhiteSpace(appsPath)) return;
+        if (!Directory.Exists(appsPath)) return;
+        if (roots.Any(root => string.Equals(Path.GetFullPath(root.AppsPath), Path.GetFullPath(appsPath), StringComparison.OrdinalIgnoreCase))) return;
+        roots.Add((appsPath, scope));
+    }
+
+    public static IReadOnlyList<InstalledApp> ScanScoopAppsFromRoots(IEnumerable<(string AppsPath, string Scope)> roots)
+    {
+        var apps = new List<InstalledApp>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (appsPath, scope) in roots)
+        {
+            if (!Directory.Exists(appsPath)) continue;
+            foreach (var appDir in SafeEnumerateDirectories(appsPath))
+            {
+                var packageId = Path.GetFileName(appDir);
+                if (string.IsNullOrWhiteSpace(packageId) || !SafePackageIdPattern.IsMatch(packageId)) continue;
+                if (!seen.Add($"{appsPath}|{packageId}")) continue;
+
+                apps.Add(new InstalledApp(
+                    packageId,
+                    "Scoop",
+                    GetScoopInstalledVersion(appDir),
+                    null,
+                    packageId,
+                    "scoop",
+                    scope));
+            }
+        }
+
+        return apps;
+    }
+
+    private static IEnumerable<string> SafeEnumerateDirectories(string path)
+    {
+        try
+        {
+            return Directory.EnumerateDirectories(path).ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string GetScoopInstalledVersion(string appDir)
+    {
+        try
+        {
+            return Directory.EnumerateDirectories(appDir)
+                .Select(Path.GetFileName)
+                .Where(name => !string.IsNullOrWhiteSpace(name) && !string.Equals(name, "current", StringComparison.OrdinalIgnoreCase))
+                .Order(StringComparer.OrdinalIgnoreCase)
+                .LastOrDefault() ?? "0.0.0";
+        }
+        catch
+        {
+            return "0.0.0";
+        }
+    }
+
     public async Task<string> UpdateAsync(AgentTask task, CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Update task {TaskId}: app={App} packageId={PackageId} productCode={ProductCode} sourceUrl={SourceUrl}",
-            task.Id, task.AppName, task.PackageId, task.ProductCode, task.SourceUrl);
+        _logger.LogInformation("Update task {TaskId}: app={App} packageId={PackageId} packageManager={PackageManager} packageScope={PackageScope} productCode={ProductCode} sourceUrl={SourceUrl}",
+            task.Id, task.AppName, task.PackageId, task.PackageManager, task.PackageScope, task.ProductCode, task.SourceUrl);
 
         if (!string.IsNullOrWhiteSpace(task.SourceUrl))
             return await InstallDownloadedPackageAsync(task, cancellationToken);
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        if (_platform.IsLinux)
         {
-            var aptName = FirstSafeAptName(task.PackageId, task.ProductCode, task.AppName);
+            var aptName = FirstSafeAptName(task.PackageId);
             if (string.IsNullOrWhiteSpace(aptName))
             {
                 _logger.LogWarning("Task {TaskId} rejected: missing or unsafe apt package name", task.Id);
                 return "Task rejected: missing or unsafe apt package name";
             }
-            var (linuxCode, linuxOut) = await RunWithExitCodeAsync("apt-get",
-                new[] { "install", "--only-upgrade", "-y", aptName }, cancellationToken);
-            return linuxCode == 0 ? linuxOut : $"Task failed: apt-get exited {linuxCode}. {linuxOut}";
+            if (!_platform.IsLinuxRoot)
+                return "Task rejected: apt-get package updates require the Linux client service to run as root";
+
+            ProcessResult aptResult;
+            try
+            {
+                aptResult = await RunWithExitCodeAsync("apt-get",
+                    new[] { "install", "--only-upgrade", "-y", aptName },
+                    new Dictionary<string, string> { ["DEBIAN_FRONTEND"] = "noninteractive" },
+                    cancellationToken);
+            }
+            catch (Win32Exception ex)
+            {
+                _logger.LogWarning(ex, "Task {TaskId} failed: apt-get was not found", task.Id);
+                return "Task failed: apt-get was not found; Linux apt support requires an Ubuntu/Debian-compatible host";
+            }
+            return aptResult.ExitCode == 0 ? aptResult.Output : $"Task failed: apt-get exited {aptResult.ExitCode}. {aptResult.Output}";
         }
 
-        if (!IsWindows())
+        if (!_platform.IsWindows)
         {
             _logger.LogWarning("Task {TaskId} rejected: unsupported OS", task.Id);
             return "Task rejected: unsupported OS";
         }
 
+        var packageManager = task.PackageManager?.Trim().ToLowerInvariant();
+        if (packageManager == "chocolatey")
+            return await RunChocolateyUpdateAsync(task, cancellationToken);
+        if (packageManager == "scoop")
+            return await RunScoopUpdateAsync(task, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(packageManager) && packageManager is not "winget" and not "msi")
+            return $"Task rejected: unsupported Windows package manager '{task.PackageManager}'";
+
+        // These component types are never in winget — skip straight to the right tool
         if (IsDotNetWorkloadComponent(task.AppName))
             return await RunDotNetWorkloadUpdateAsync(task, cancellationToken);
 
+        if (IsVisualStudioOrWindowsSdkComponent(task.AppName))
+            return await RunVisualStudioInstallerUpdateAsync(task, cancellationToken);
+
+        // For everything else, try winget first, then fall back to component updaters
         var wingetResult = await RunWingetUpdateAsync(task, cancellationToken);
         if (!wingetResult.StartsWith("Task failed: no winget match", StringComparison.OrdinalIgnoreCase))
             return wingetResult;
 
         var componentResult = await TryRunWindowsComponentUpdateAsync(task, cancellationToken);
         return componentResult ?? wingetResult;
+    }
+
+    private async Task<string> RunChocolateyUpdateAsync(AgentTask task, CancellationToken cancellationToken)
+    {
+        var packageId = SafePackageId(task.PackageId);
+        if (packageId is null)
+            return "Task rejected: missing or unsafe Chocolatey package identifier";
+
+        try
+        {
+            _logger.LogInformation("Running Chocolatey upgrade for task {TaskId} package={PackageId}", task.Id, packageId);
+            var result = await RunWithExitCodeAsync("choco", ["upgrade", packageId, "-y", "--limit-output"], cancellationToken);
+            if (result.ExitCode is 0 or 3010 or 1641) return result.Output;
+            if (result.ExitCode == 2 || IsAlreadyUpToDate(result.Output)) return $"Already up to date: {result.Output}";
+            if (IsChocolateySelectionFailure(result.Output)) return $"Task failed: no Chocolatey match could be upgraded. {result.Output}";
+            return $"Task failed: choco upgrade exited {result.ExitCode}. {result.Output}";
+        }
+        catch (Win32Exception ex)
+        {
+            _logger.LogWarning(ex, "Chocolatey executable was not found for task {TaskId}", task.Id);
+            return "Task rejected: Chocolatey executable was not found on this device";
+        }
+    }
+
+    private async Task<string> RunScoopUpdateAsync(AgentTask task, CancellationToken cancellationToken)
+    {
+        if (string.Equals(task.PackageScope, "user", StringComparison.OrdinalIgnoreCase))
+            return "Task rejected: per-user Scoop packages are inventory-only in this release";
+
+        var packageId = SafePackageId(task.PackageId);
+        if (packageId is null)
+            return "Task rejected: missing or unsafe Scoop package identifier";
+
+        var args = new List<string> { "update", packageId };
+        if (string.Equals(task.PackageScope, "global", StringComparison.OrdinalIgnoreCase))
+            args.Add("--global");
+
+        try
+        {
+            _logger.LogInformation("Running Scoop update for task {TaskId} package={PackageId} scope={Scope}", task.Id, packageId, task.PackageScope ?? "system");
+            var result = await RunWithExitCodeAsync("scoop", args.ToArray(), cancellationToken);
+            if (result.ExitCode == 0) return result.Output;
+            if (IsScoopNoOp(result.Output)) return $"Already up to date: {result.Output}";
+            if (IsScoopSelectionFailure(result.Output)) return $"Task failed: no Scoop match could be upgraded. {result.Output}";
+            return $"Task failed: scoop update exited {result.ExitCode}. {result.Output}";
+        }
+        catch (Win32Exception ex)
+        {
+            _logger.LogWarning(ex, "Scoop executable was not found for task {TaskId}", task.Id);
+            return "Task rejected: Scoop executable was not found on this device";
+        }
     }
 
     private async Task<string> RunWingetUpdateAsync(AgentTask task, CancellationToken cancellationToken)
@@ -191,7 +403,7 @@ public sealed class PlatformPackageProvider : IPackageProvider
         return $"Task failed: no winget match could be upgraded. {string.Join(Environment.NewLine, outputs)}";
     }
 
-    private Task<(int ExitCode, string Output)> RunWingetUpgradeAsync(string[] selectorArguments, CancellationToken cancellationToken)
+    private Task<ProcessResult> RunWingetUpgradeAsync(string[] selectorArguments, CancellationToken cancellationToken)
     {
         var args = new List<string> { "upgrade" };
         args.AddRange(selectorArguments);
@@ -218,12 +430,28 @@ public sealed class PlatformPackageProvider : IPackageProvider
         output.Contains("Es wurde kein installiertes Paket gefunden", StringComparison.OrdinalIgnoreCase) ||
         output.Contains("Es wurde kein Paket gefunden", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsChocolateySelectionFailure(string output) =>
+        output.Contains("not installed", StringComparison.OrdinalIgnoreCase) ||
+        output.Contains("not found", StringComparison.OrdinalIgnoreCase) ||
+        output.Contains("Unable to find", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsScoopNoOp(string output) =>
+        output.Contains("Latest versions for all apps are installed", StringComparison.OrdinalIgnoreCase) ||
+        output.Contains("is already up-to-date", StringComparison.OrdinalIgnoreCase) ||
+        output.Contains("No updates available", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsScoopSelectionFailure(string output) =>
+        output.Contains("Couldn't find manifest", StringComparison.OrdinalIgnoreCase) ||
+        output.Contains("isn't installed", StringComparison.OrdinalIgnoreCase) ||
+        output.Contains("is not installed", StringComparison.OrdinalIgnoreCase) ||
+        output.Contains("No app matches", StringComparison.OrdinalIgnoreCase);
+
     private async Task<string> InstallDownloadedPackageAsync(AgentTask task, CancellationToken cancellationToken)
     {
-        if (!IsWindows())
+        if (!_platform.IsWindows)
         {
             _logger.LogWarning("Task {TaskId} rejected: downloaded packages only supported on Windows", task.Id);
-            return "Task rejected: downloaded MSI packages are currently supported on Windows only";
+            return "Task rejected: downloaded package artifacts are currently supported on Windows only";
         }
         if (string.IsNullOrWhiteSpace(task.Sha256))
         {
@@ -419,8 +647,7 @@ public sealed class PlatformPackageProvider : IPackageProvider
                 "--installPath",
                 installPath,
                 "--quiet",
-                "--norestart",
-                "--wait"
+                "--norestart"
             ], cancellationToken);
             outputs.Add($"Visual Studio Installer update for {installPath} exited {code}: {output}");
             if (code != 0 && code != 3010)
@@ -435,7 +662,12 @@ public sealed class PlatformPackageProvider : IPackageProvider
         if (string.IsNullOrWhiteSpace(appName)) return false;
         return appName.Contains("Microsoft.NET.Workload", StringComparison.OrdinalIgnoreCase) ||
                appName.Contains(".NET Workload", StringComparison.OrdinalIgnoreCase) ||
-               appName.Contains("DotNet Workload", StringComparison.OrdinalIgnoreCase);
+               appName.Contains("DotNet Workload", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains("Microsoft.NET.Sdk.", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains("Microsoft.NET.Runtime.", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains("Microsoft.NET.Component.", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains(".NET.Sdk.", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains(".NET.Runtime.", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsVisualStudioOrWindowsSdkComponent(string? appName)
@@ -444,7 +676,10 @@ public sealed class PlatformPackageProvider : IPackageProvider
         return appName.Contains("Visual Studio", StringComparison.OrdinalIgnoreCase) ||
                appName.Contains("Build Tools", StringComparison.OrdinalIgnoreCase) ||
                appName.Contains("Windows SDK", StringComparison.OrdinalIgnoreCase) ||
-               appName.Contains("WinRT Intellisense", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains("WinRT", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains("Intellisense", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains("Windows IoT", StringComparison.OrdinalIgnoreCase) ||
+               appName.Contains("Extension SDK", StringComparison.OrdinalIgnoreCase) ||
                appName.Contains("Universal CRT", StringComparison.OrdinalIgnoreCase) ||
                appName.Contains("Application Verifier", StringComparison.OrdinalIgnoreCase) ||
                appName.Contains("Windows Team Extension SDK", StringComparison.OrdinalIgnoreCase);
@@ -460,9 +695,6 @@ public sealed class PlatformPackageProvider : IPackageProvider
         return args.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                    .All(allowed.Contains);
     }
-
-    [SupportedOSPlatformGuard("windows")]
-    private static bool IsWindows() => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
     [SuppressMessage("Interoperability", "CA1416", Justification = "Called only after Windows OS check.")]
     private static List<InstalledApp> GetWindowsRegistryApps()
@@ -493,46 +725,49 @@ public sealed class PlatformPackageProvider : IPackageProvider
         return apps;
     }
 
-    private static async Task<IReadOnlyList<InstalledApp>> GetLinuxAppsAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<InstalledApp>> GetLinuxAppsAsync(CancellationToken cancellationToken)
     {
-        var output = await RunAsync("dpkg-query",
-            new[] { "-W", "-f=${Package}|${Version}|${Maintainer}\\n" },
-            cancellationToken);
+        string output;
+        try
+        {
+            output = await RunAsync("dpkg-query",
+                new[] { "-W", "-f=${Package}|${Version}|${Maintainer}\\n" },
+                cancellationToken);
+        }
+        catch (Win32Exception ex)
+        {
+            throw new InvalidOperationException("Linux inventory requires dpkg-query; this host does not look like an Ubuntu/Debian-compatible system", ex);
+        }
+        return ParseDpkgQueryOutput(output);
+    }
+
+    public static IReadOnlyList<InstalledApp> ParseDpkgQueryOutput(string output)
+    {
         return output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
             .Select(line => line.Split('|'))
             .Where(parts => parts.Length >= 2)
-            .Select(parts => new InstalledApp(parts[0], parts.Length > 2 ? parts[2] : "", parts[1], null, parts[0]))
+            .Select(parts => new InstalledApp(parts[0], parts.Length > 2 ? parts[2] : "", parts[1], null, parts[0], "apt", "system"))
             .ToList();
     }
 
     // FIX #11: accept string[] arguments so they are never shell-interpolated
-    private static async Task<string> RunAsync(string fileName, string[] arguments, CancellationToken cancellationToken)
+    private async Task<string> RunAsync(string fileName, string[] arguments, CancellationToken cancellationToken)
     {
-        var (_, output) = await RunWithExitCodeAsync(fileName, arguments, cancellationToken);
-        return output;
+        var result = await RunWithExitCodeAsync(fileName, arguments, cancellationToken);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"{fileName} exited {result.ExitCode}. {result.Output}");
+        return result.Output;
     }
 
-    private static async Task<(int ExitCode, string Output)> RunWithExitCodeAsync(string fileName, string[] arguments, CancellationToken cancellationToken)
+    private Task<ProcessResult> RunWithExitCodeAsync(string fileName, string[] arguments, CancellationToken cancellationToken)
+        => RunWithExitCodeAsync(fileName, arguments, null, cancellationToken);
+
+    private Task<ProcessResult> RunWithExitCodeAsync(
+        string fileName,
+        string[] arguments,
+        IReadOnlyDictionary<string, string>? environment,
+        CancellationToken cancellationToken)
     {
-        var psi = new ProcessStartInfo(fileName)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        // Pass each argument individually — avoids any quoting/injection issues
-        foreach (var arg in arguments)
-            psi.ArgumentList.Add(arg);
-
-        using var process = Process.Start(psi)
-            ?? throw new InvalidOperationException($"Could not start {fileName}");
-
-        var stdout = await process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderr = await process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken);
-
-        var output = string.IsNullOrWhiteSpace(stderr) ? stdout : $"{stdout}\n{stderr}";
-        return (process.ExitCode, output);
+        return _processRunner.RunAsync(fileName, arguments, environment, cancellationToken);
     }
 }

@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "1patch-client": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
+    }
+  }
+}

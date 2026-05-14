@@ -1,3 +1,5 @@
+using OnePatch.Client.Models;
+
 namespace OnePatch.Client.Services;
 
 public enum SecurityMode { Normal, Strict, Tinfoil }
@@ -14,6 +16,9 @@ public sealed class ClientOptions
 
     /// <summary>keyId → PEM public key for signature verification.</summary>
     public Dictionary<string, string> TrustedSigningPublicKeys { get; set; } = [];
+
+    /// <summary>keyId → scoped signing metadata for signature verification.</summary>
+    public Dictionary<string, SigningKeyMetadata> TrustedSigningKeys { get; set; } = [];
     
 
     /// <summary>

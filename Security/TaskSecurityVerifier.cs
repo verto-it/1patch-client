@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OnePatch.Client.Models;
@@ -28,6 +29,15 @@ namespace OnePatch.Client.Security;
 public sealed class TaskSecurityVerifier
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
+
+    // Used when building canonical JSON for signature verification.
+    // TypeScript's canonicalJson() skips undefined properties; after deserialising
+    // the server JSON in C# those absent fields become null. WhenWritingNull ensures
+    // we exclude them too so both sides produce identical canonical bytes.
+    private static readonly JsonSerializerOptions CanonicalOpts = new(JsonSerializerDefaults.Web)
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
     private readonly ClientOptions _options;
     private readonly ILogger<TaskSecurityVerifier> _logger;
 
@@ -49,14 +59,16 @@ public sealed class TaskSecurityVerifier
         if (!string.Equals(envelope.Algorithm, "ES256", StringComparison.Ordinal))
             Reject("Unsupported signature algorithm", envelope);
 
+        if (!string.Equals(envelope.Scope, envelope.PayloadType, StringComparison.Ordinal))
+            Reject($"Scope '{envelope.Scope}' does not match payload type '{envelope.PayloadType}'", envelope);
+
         if (!string.Equals(envelope.PayloadType, "task_bundle", StringComparison.Ordinal))
             Reject($"Wrong payload type '{envelope.PayloadType}' - expected 'task_bundle'", envelope);
 
         if (!string.Equals(envelope.TenantId, _options.TenantId, StringComparison.Ordinal))
             Reject($"TenantId mismatch: envelope={envelope.TenantId} client={_options.TenantId}", envelope);
 
-        if (!_options.TrustedSigningPublicKeys.ContainsKey(envelope.KeyId))
-            Reject($"Unknown signing key '{envelope.KeyId}'", envelope);
+        _ = ResolveTrustedKey(envelope.KeyId, "task_bundle", envelope.TenantId);
 
         if (!DateTimeOffset.TryParse(envelope.ExpiresAt, out var expiresAt) || expiresAt <= DateTimeOffset.UtcNow)
             Reject("Signed envelope has expired", envelope);
@@ -69,12 +81,11 @@ public sealed class TaskSecurityVerifier
         VerifySignature(envelope);
 
         // 4. Verify payloadHash if present
-        if (envelope.PayloadHash is not null)
-        {
-            var computedHash = ComputePayloadHash(envelope.Payload);
-            if (!string.Equals(envelope.PayloadHash, computedHash, StringComparison.OrdinalIgnoreCase))
-                Reject("Payload hash mismatch - task bundle may have been tampered with", envelope);
-        }
+        if (string.IsNullOrWhiteSpace(envelope.PayloadHash))
+            Reject("Missing payloadHash - task bundle may have been tampered with", envelope);
+        var computedHash = ComputePayloadHash(envelope.Payload);
+        if (!string.Equals(envelope.PayloadHash, computedHash, StringComparison.OrdinalIgnoreCase))
+            Reject("Payload hash mismatch - task bundle may have been tampered with", envelope);
 
         var bundle = envelope.Payload;
 
@@ -95,6 +106,8 @@ public sealed class TaskSecurityVerifier
 
         if (!DateTimeOffset.TryParse(ledger.ExpiresAt, out var ledgerExpiry) || ledgerExpiry <= DateTimeOffset.UtcNow)
             Reject("Ledger entry has expired", envelope);
+
+        VerifyLedgerSignature(ledger, envelope);
 
         // 6. Per-task checks
         foreach (var task in bundle.Tasks)
@@ -128,7 +141,7 @@ public sealed class TaskSecurityVerifier
         }
 
         // Trusted source host (all modes, update_package)
-        if (string.Equals(task.Type, "update_package", StringComparison.Ordinal))
+        if (string.Equals(task.Type, "update_package", StringComparison.Ordinal) && !IsDevelopment())
         {
             if (string.IsNullOrEmpty(task.SourceUrl) || !task.SourceUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 Reject($"Task {task.Id} has non-HTTPS source URL", task);
@@ -153,8 +166,7 @@ public sealed class TaskSecurityVerifier
 
     private void VerifySignature<T>(SignedEnvelope<T> envelope)
     {
-        if (!_options.TrustedSigningPublicKeys.TryGetValue(envelope.KeyId, out var pemKey))
-            Reject($"No public key for keyId '{envelope.KeyId}'", envelope);
+        var keyMeta = ResolveTrustedKey(envelope.KeyId, envelope.PayloadType, envelope.TenantId);
 
         var unsigned = new
         {
@@ -165,22 +177,117 @@ public sealed class TaskSecurityVerifier
             nonce       = envelope.Nonce,
             payload     = envelope.Payload,
             payloadHash = envelope.PayloadHash,
+            scope       = envelope.Scope,
             payloadType = envelope.PayloadType,
             tenantId    = envelope.TenantId,
         };
 
-        var canonicalBytes = Encoding.UTF8.GetBytes(CanonicalJson(JsonSerializer.SerializeToElement(unsigned, JsonOpts)));
+        var canonicalBytes = Encoding.UTF8.GetBytes(CanonicalJson(JsonSerializer.SerializeToElement(unsigned, CanonicalOpts)));
         var sig = Base64UrlDecode(envelope.Signature);
 
         using var ecdsa = ECDsa.Create();
-        ecdsa.ImportFromPem(pemKey!.Replace("\\n", "\n"));
+        ecdsa.ImportFromPem(keyMeta.PublicKeyPem.Replace("\\n", "\n"));
         if (!ecdsa.VerifyData(canonicalBytes, sig, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation))
             Reject($"Invalid ECDSA signature (keyId={envelope.KeyId})", envelope);
     }
 
+    private void VerifyLedgerSignature(TaskLedgerEntry ledger, object context)
+    {
+        if (!string.Equals(ledger.Algorithm, "ES256", StringComparison.Ordinal))
+            Reject("Unsupported ledger signature algorithm", context);
+        if (!string.Equals(ledger.Scope, "task_ledger", StringComparison.Ordinal))
+            Reject($"Wrong ledger signing scope '{ledger.Scope}'", context);
+        if (string.IsNullOrWhiteSpace(ledger.PayloadHash))
+            Reject("Ledger entry is missing payloadHash", context);
+        if (!DateTimeOffset.TryParse(ledger.IssuedAt, out _) || string.IsNullOrWhiteSpace(ledger.Nonce))
+            Reject("Ledger entry has invalid signature metadata", context);
+
+        var payload = new
+        {
+            ledgerId = ledger.LedgerId,
+            taskId = ledger.TaskId,
+            tenantId = ledger.TenantId,
+            createdBy = ledger.CreatedBy,
+            createdAt = ledger.CreatedAt,
+            visibleInDashboard = ledger.VisibleInDashboard,
+            taskHash = ledger.TaskHash,
+            riskScore = ledger.RiskScore,
+            approvals = ledger.Approvals,
+            notBefore = ledger.NotBefore,
+            expiresAt = ledger.ExpiresAt,
+        };
+        var computedHash = ComputePayloadHash(payload);
+        if (!string.Equals(ledger.PayloadHash, computedHash, StringComparison.OrdinalIgnoreCase))
+            Reject("Ledger payload hash mismatch", context);
+
+        var keyMeta = ResolveTrustedKey(ledger.KeyId, "task_ledger", ledger.TenantId);
+        var unsigned = new
+        {
+            algorithm = ledger.Algorithm,
+            expiresAt = ledger.ExpiresAt,
+            issuedAt = ledger.IssuedAt,
+            keyId = ledger.KeyId,
+            nonce = ledger.Nonce,
+            payload,
+            payloadHash = ledger.PayloadHash,
+            scope = ledger.Scope,
+            payloadType = ledger.Scope,
+            tenantId = ledger.TenantId,
+        };
+        var canonicalBytes = Encoding.UTF8.GetBytes(CanonicalJson(JsonSerializer.SerializeToElement(unsigned, CanonicalOpts)));
+        var sig = Base64UrlDecode(ledger.Signature);
+
+        using var ecdsa = ECDsa.Create();
+        ecdsa.ImportFromPem(keyMeta.PublicKeyPem.Replace("\\n", "\n"));
+        if (!ecdsa.VerifyData(canonicalBytes, sig, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation))
+            Reject($"Invalid ledger ECDSA signature (keyId={ledger.KeyId})", context);
+    }
+
+    private SigningKeyMetadata ResolveTrustedKey(string keyId, string expectedScope, string tenantId)
+    {
+        SigningKeyMetadata? meta = null;
+        if (!_options.TrustedSigningKeys.TryGetValue(keyId, out meta))
+        {
+            if (IsDevelopment() &&
+                _options.TrustedSigningKeys.Count == 0 &&
+                _options.TrustedSigningPublicKeys.TryGetValue(keyId, out var legacyPem) &&
+                !string.IsNullOrWhiteSpace(legacyPem))
+            {
+                meta = new SigningKeyMetadata { KeyId = keyId, Scope = expectedScope, Status = "active", PublicKeyPem = legacyPem, IssuedAt = DateTimeOffset.UtcNow.ToString("O"), IsDev = true, Algorithm = "ES256" };
+            }
+            else
+            {
+                Reject($"Unknown signing key '{keyId}'", new { keyId, expectedScope });
+            }
+        }
+
+        if (string.Equals(meta!.Scope, "*", StringComparison.Ordinal) && !IsDevelopment())
+            Reject($"Wildcard signing key '{keyId}' is not trusted", new { keyId, expectedScope });
+        if (!string.Equals(meta.Scope, "*", StringComparison.Ordinal) && !string.Equals(meta.Scope, expectedScope, StringComparison.Ordinal))
+            Reject($"Signing key '{keyId}' is scoped to '{meta.Scope}', not '{expectedScope}'", new { keyId, expectedScope });
+        if (!string.Equals(meta.Algorithm, "ES256", StringComparison.Ordinal))
+            Reject($"Unsupported signing key algorithm '{meta.Algorithm}'", new { keyId, expectedScope });
+        if (string.Equals(meta.Status, "revoked", StringComparison.Ordinal))
+            Reject($"Signing key '{keyId}' has been revoked", new { keyId, expectedScope });
+        if (string.Equals(meta.Status, "retired", StringComparison.Ordinal))
+        {
+            if (!DateTimeOffset.TryParse(meta.RetirementDeadline, out var deadline) || deadline <= DateTimeOffset.UtcNow)
+                Reject($"Signing key '{keyId}' retirement deadline has passed", new { keyId, expectedScope });
+        }
+        if (meta.IsDev && !IsDevelopment())
+            Reject($"Dev signing key '{keyId}' is not trusted", new { keyId, expectedScope });
+        if (meta.AllowedTenants is { Length: > 0 } && !meta.AllowedTenants.Contains(tenantId, StringComparer.Ordinal))
+            Reject($"Signing key '{keyId}' is not allowed for tenant '{tenantId}'", new { keyId, expectedScope });
+        return meta;
+    }
+
+    private static bool IsDevelopment()
+        => string.Equals(Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase);
+
     private static string ComputePayloadHash<T>(T payload)
     {
-        var json = JsonSerializer.Serialize(payload, JsonOpts);
+        var json = JsonSerializer.Serialize(payload, CanonicalOpts);
         var canonical = CanonicalJson(JsonDocument.Parse(json).RootElement);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
     }

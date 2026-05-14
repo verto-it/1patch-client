@@ -81,6 +81,7 @@ public sealed class BackendNodeClient
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogWarning("Heartbeat rejected: HTTP {Status} - {Body}", (int)response.StatusCode, body);
+            _nodes.InvalidateStickyNode(node.Id);
         }
         else
         {
@@ -103,6 +104,7 @@ public sealed class BackendNodeClient
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogError("Inventory upload failed: HTTP {Status} - {Body}", (int)response.StatusCode, body);
+            _nodes.InvalidateStickyNode(node.Id);
             response.EnsureSuccessStatusCode();
         }
         _logger.LogInformation("Inventory upload successful ({Count} apps)", appList.Count);
@@ -121,6 +123,7 @@ public sealed class BackendNodeClient
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogWarning("Task poll failed: HTTP {Status} - {Body}", (int)response.StatusCode, body);
+            _nodes.InvalidateStickyNode(node.Id);
             return [];
         }
 
@@ -145,6 +148,7 @@ public sealed class BackendNodeClient
             }
 
             if (envelope is not null &&
+                string.Equals(envelope.Scope, "task_bundle", StringComparison.Ordinal) &&
                 string.Equals(envelope.PayloadType, "task_bundle", StringComparison.Ordinal) &&
                 string.Equals(envelope.TenantId, _options.TenantId, StringComparison.Ordinal))
             {
@@ -172,6 +176,7 @@ public sealed class BackendNodeClient
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogWarning("Kill switch poll failed: HTTP {Status} - {Body}", (int)response.StatusCode, body);
+            _nodes.InvalidateStickyNode(node.Id);
             return null;
         }
 
@@ -200,6 +205,7 @@ public sealed class BackendNodeClient
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogWarning("Task result report failed: HTTP {Status} - {Body}", (int)response.StatusCode, body);
+            _nodes.InvalidateStickyNode(node.Id);
         }
         else
         {
