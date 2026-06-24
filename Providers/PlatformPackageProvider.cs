@@ -22,6 +22,7 @@ public sealed class PlatformPackageProvider : IPackageProvider
     // Package names are passed as ProcessStartInfo.ArgumentList entries, never through a shell.
     private static readonly Regex SafePackageIdPattern = new(@"^[A-Za-z0-9._\-]+$", RegexOptions.Compiled);
     private static readonly Regex SafeAptPackagePattern = new(@"^[a-z0-9][a-z0-9+.\-]*$", RegexOptions.Compiled);
+    private static readonly Regex SafeFlatpakPackagePattern = new(@"^[A-Za-z0-9][A-Za-z0-9._\-]*$", RegexOptions.Compiled);
 
     public PlatformPackageProvider(
         IHttpClientFactory httpClientFactory,
@@ -48,7 +49,7 @@ public sealed class PlatformPackageProvider : IPackageProvider
         }
         if (_platform.IsLinux)
         {
-            _logger.LogInformation("Enumerating installed Linux (dpkg) applications");
+            _logger.LogInformation("Enumerating installed Linux applications");
             return GetLinuxAppsAsync(cancellationToken);
         }
         _logger.LogWarning("GetInstalledApps: unsupported OS — returning empty list");
@@ -262,29 +263,7 @@ public sealed class PlatformPackageProvider : IPackageProvider
 
         if (_platform.IsLinux)
         {
-            var aptName = FirstSafeAptName(task.PackageId);
-            if (string.IsNullOrWhiteSpace(aptName))
-            {
-                _logger.LogWarning("Task {TaskId} rejected: missing or unsafe apt package name", task.Id);
-                return "Task rejected: missing or unsafe apt package name";
-            }
-            if (!_platform.IsLinuxRoot)
-                return "Task rejected: apt-get package updates require the Linux client service to run as root";
-
-            ProcessResult aptResult;
-            try
-            {
-                aptResult = await RunWithExitCodeAsync("apt-get",
-                    new[] { "install", "--only-upgrade", "-y", aptName },
-                    new Dictionary<string, string> { ["DEBIAN_FRONTEND"] = "noninteractive" },
-                    cancellationToken);
-            }
-            catch (Win32Exception ex)
-            {
-                _logger.LogWarning(ex, "Task {TaskId} failed: apt-get was not found", task.Id);
-                return "Task failed: apt-get was not found; Linux apt support requires an Ubuntu/Debian-compatible host";
-            }
-            return aptResult.ExitCode == 0 ? aptResult.Output : $"Task failed: apt-get exited {aptResult.ExitCode}. {aptResult.Output}";
+            return await RunLinuxPackageUpdateAsync(task, cancellationToken);
         }
 
         if (!_platform.IsWindows)
@@ -446,6 +425,89 @@ public sealed class PlatformPackageProvider : IPackageProvider
         output.Contains("is not installed", StringComparison.OrdinalIgnoreCase) ||
         output.Contains("No app matches", StringComparison.OrdinalIgnoreCase);
 
+    private async Task<string> RunLinuxPackageUpdateAsync(AgentTask task, CancellationToken cancellationToken)
+    {
+        if (!_platform.IsLinuxRoot)
+            return "Task rejected: Linux package updates require the client service to run as root";
+
+        var packageManager = task.PackageManager?.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(packageManager)) packageManager = "apt";
+
+        return packageManager switch
+        {
+            "apt" => await RunAptUpdateAsync(task, cancellationToken),
+            "snap" => await RunSnapUpdateAsync(task, cancellationToken),
+            "flatpak" => await RunFlatpakUpdateAsync(task, cancellationToken),
+            _ => $"Task rejected: unsupported Linux package manager '{task.PackageManager}'"
+        };
+    }
+
+    private async Task<string> RunAptUpdateAsync(AgentTask task, CancellationToken cancellationToken)
+    {
+        var packageId = FirstSafeAptName(task.PackageId);
+        if (string.IsNullOrWhiteSpace(packageId))
+        {
+            _logger.LogWarning("Task {TaskId} rejected: missing or unsafe apt package name", task.Id);
+            return "Task rejected: missing or unsafe apt package name";
+        }
+
+        try
+        {
+            var result = await RunWithExitCodeAsync("apt-get",
+                ["install", "--only-upgrade", "-y", packageId],
+                new Dictionary<string, string> { ["DEBIAN_FRONTEND"] = "noninteractive" },
+                cancellationToken);
+            return result.ExitCode == 0 ? result.Output : $"Task failed: apt-get exited {result.ExitCode}. {result.Output}";
+        }
+        catch (Win32Exception ex)
+        {
+            _logger.LogWarning(ex, "Task {TaskId} failed: apt-get was not found", task.Id);
+            return "Task failed: apt-get was not found; Linux apt support requires an Ubuntu/Debian-compatible host";
+        }
+    }
+
+    private async Task<string> RunSnapUpdateAsync(AgentTask task, CancellationToken cancellationToken)
+    {
+        var packageId = FirstSafeAptName(task.PackageId);
+        if (string.IsNullOrWhiteSpace(packageId))
+            return "Task rejected: missing or unsafe Snap package name";
+
+        try
+        {
+            var result = await RunWithExitCodeAsync("snap", ["refresh", packageId], cancellationToken);
+            if (result.ExitCode == 0) return result.Output;
+            if (result.Output.Contains("has no updates available", StringComparison.OrdinalIgnoreCase))
+                return $"Already up to date: {result.Output}";
+            return $"Task failed: snap refresh exited {result.ExitCode}. {result.Output}";
+        }
+        catch (Win32Exception ex)
+        {
+            _logger.LogWarning(ex, "Task {TaskId} failed: snap was not found", task.Id);
+            return "Task rejected: snap executable was not found on this device";
+        }
+    }
+
+    private async Task<string> RunFlatpakUpdateAsync(AgentTask task, CancellationToken cancellationToken)
+    {
+        var packageId = SafeFlatpakPackageId(task.PackageId);
+        if (packageId is null)
+            return "Task rejected: missing or unsafe Flatpak application id";
+
+        try
+        {
+            var result = await RunWithExitCodeAsync("flatpak", ["update", "-y", packageId], cancellationToken);
+            if (result.ExitCode == 0) return result.Output;
+            if (result.Output.Contains("Nothing to do", StringComparison.OrdinalIgnoreCase))
+                return $"Already up to date: {result.Output}";
+            return $"Task failed: flatpak update exited {result.ExitCode}. {result.Output}";
+        }
+        catch (Win32Exception ex)
+        {
+            _logger.LogWarning(ex, "Task {TaskId} failed: flatpak was not found", task.Id);
+            return "Task rejected: flatpak executable was not found on this device";
+        }
+    }
+
     private async Task<string> InstallDownloadedPackageAsync(AgentTask task, CancellationToken cancellationToken)
     {
         if (!_platform.IsWindows)
@@ -467,8 +529,12 @@ public sealed class PlatformPackageProvider : IPackageProvider
             return "Task rejected: package source URL is not in the trusted hosts allowlist";
         }
 
-        var args = string.IsNullOrWhiteSpace(task.InstallArgs) ? "/qn /norestart" : task.InstallArgs;
-        if (!IsSafeMsiArgumentString(args))
+        var packageManager = task.PackageManager?.Trim().ToLowerInvariant();
+        var isExe = packageManager == "exe";
+        var args = string.IsNullOrWhiteSpace(task.InstallArgs)
+            ? isExe ? "/quiet /norestart" : "/qn /norestart"
+            : task.InstallArgs;
+        if (!IsSafeInstallerArgumentString(args, isExe))
         {
             _logger.LogWarning("Task {TaskId} rejected: install arguments '{Args}' not in allowlist", task.Id, args);
             return "Task rejected: install arguments are not allowlisted";
@@ -487,13 +553,14 @@ public sealed class PlatformPackageProvider : IPackageProvider
 
         try
         {
-            _logger.LogInformation("Running msiexec for task {TaskId}, file={Path}, args={Args}", task.Id, path, args);
-            // FIX #11: pass arguments as a list, not a single interpolated string
-            var allArgs = new[] { "/i", path }.Concat(args.Split(' ', StringSplitOptions.RemoveEmptyEntries)).ToArray();
-            var (code, output) = await RunWithExitCodeAsync("msiexec.exe", allArgs, cancellationToken);
-            // msiexec returns 0 on success, 3010 = success-but-reboot-required
+            var argList = TokenizeInstallerArgs(args);
+            var (code, output) = isExe
+                ? await RunWithExitCodeAsync(path, argList, cancellationToken)
+                : await RunWithExitCodeAsync("msiexec.exe", new[] { "/i", path }.Concat(argList).ToArray(), cancellationToken);
+            _logger.LogInformation("Installer finished for task {TaskId}, file={Path}, code={Code}", task.Id, path, code);
             if (code == 0 || code == 3010) return output;
-            return $"Task failed: msiexec exited {code}. {output}";
+            if (code == 1641) return output;
+            return $"Task failed: installer exited {code}. {output}";
         }
         finally
         {
@@ -528,7 +595,8 @@ public sealed class PlatformPackageProvider : IPackageProvider
         }
 
         _logger.LogInformation("Package hash verified OK for task {TaskId}", task.Id);
-        var path = Path.Combine(Path.GetTempPath(), $"1patch-{task.PackageArtifactId ?? task.Id}.msi");
+        var ext = string.Equals(task.PackageManager, "exe", StringComparison.OrdinalIgnoreCase) ? ".exe" : ".msi";
+        var path = Path.Combine(Path.GetTempPath(), $"1patch-{task.PackageArtifactId ?? task.Id}{ext}");
         await File.WriteAllBytesAsync(path, data, cancellationToken);
         return path;
     }
@@ -580,6 +648,12 @@ public sealed class PlatformPackageProvider : IPackageProvider
     {
         var trimmed = value?.Trim();
         return !string.IsNullOrWhiteSpace(trimmed) && SafePackageIdPattern.IsMatch(trimmed) ? trimmed : null;
+    }
+
+    private static string? SafeFlatpakPackageId(string? value)
+    {
+        var trimmed = value?.Trim();
+        return !string.IsNullOrWhiteSpace(trimmed) && trimmed.Contains('.') && SafeFlatpakPackagePattern.IsMatch(trimmed) ? trimmed : null;
     }
 
     private static string? FirstSafeAptName(params string?[] values)
@@ -686,14 +760,33 @@ public sealed class PlatformPackageProvider : IPackageProvider
     }
 
     // FIX #17: split on all whitespace and trim each token
-    private static bool IsSafeMsiArgumentString(string args)
+    private static bool IsSafeInstallerArgumentString(string args, bool allowExeStyleArgs)
     {
-        var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        var allowedMsi = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "/qn", "/quiet", "/norestart", "ALLUSERS=1", "REBOOT=ReallySuppress"
         };
-        return args.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                   .All(allowed.Contains);
+        var tokens = TokenizeInstallerArgs(args);
+        if (!allowExeStyleArgs) return tokens.All(allowedMsi.Contains);
+
+        var allowedExe = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "/S", "/silent", "/verysilent", "/quiet", "/qn", "/norestart",
+            "--silent", "--quiet", "--norestart", "--accept-license", "--accept-package-agreements",
+            "-s", "-q", "-y"
+        };
+        return tokens.All(token =>
+            allowedExe.Contains(token) ||
+            Regex.IsMatch(token, @"^[A-Za-z][A-Za-z0-9_.-]{0,40}=(?:[A-Za-z0-9_.:@%+\-\\ ]{0,120})$"));
+    }
+
+    private static string[] TokenizeInstallerArgs(string args)
+    {
+        var matches = Regex.Matches(args, @""".+?""|\S+");
+        return matches
+            .Select(m => m.Value.Trim().Trim('"'))
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .ToArray();
     }
 
     [SuppressMessage("Interoperability", "CA1416", Justification = "Called only after Windows OS check.")]
@@ -738,7 +831,11 @@ public sealed class PlatformPackageProvider : IPackageProvider
         {
             throw new InvalidOperationException("Linux inventory requires dpkg-query; this host does not look like an Ubuntu/Debian-compatible system", ex);
         }
-        return ParseDpkgQueryOutput(output);
+        var apps = new List<InstalledApp>();
+        apps.AddRange(ParseDpkgQueryOutput(output));
+        apps.AddRange(await TryGetSnapAppsAsync(cancellationToken));
+        apps.AddRange(await TryGetFlatpakAppsAsync(cancellationToken));
+        return apps;
     }
 
     public static IReadOnlyList<InstalledApp> ParseDpkgQueryOutput(string output)
@@ -748,6 +845,57 @@ public sealed class PlatformPackageProvider : IPackageProvider
             .Where(parts => parts.Length >= 2)
             .Select(parts => new InstalledApp(parts[0], parts.Length > 2 ? parts[2] : "", parts[1], null, parts[0], "apt", "system"))
             .ToList();
+    }
+
+    public static IReadOnlyList<InstalledApp> ParseSnapListOutput(string output)
+    {
+        return output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Skip(1)
+            .Select(line => Regex.Split(line, @"\s+"))
+            .Where(parts => parts.Length >= 2 && SafeAptPackagePattern.IsMatch(parts[0]))
+            .Select(parts => new InstalledApp(parts[0], "Snap", parts[1], null, parts[0], "snap", "system"))
+            .ToList();
+    }
+
+    public static IReadOnlyList<InstalledApp> ParseFlatpakListOutput(string output)
+    {
+        return output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => line.Split('\t'))
+            .Where(parts => parts.Length >= 3 && SafeFlatpakPackageId(parts[1]) is not null)
+            .Select(parts => new InstalledApp(parts[0], "Flatpak", parts[2], null, parts[1], "flatpak", "system"))
+            .ToList();
+    }
+
+    private async Task<IReadOnlyList<InstalledApp>> TryGetSnapAppsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var output = await RunAsync("snap", ["list"], cancellationToken);
+            var apps = ParseSnapListOutput(output);
+            _logger.LogInformation("Snap inventory resolved {Count} package(s)", apps.Count);
+            return apps;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Snap inventory skipped because snap was unavailable or failed");
+            return [];
+        }
+    }
+
+    private async Task<IReadOnlyList<InstalledApp>> TryGetFlatpakAppsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var output = await RunAsync("flatpak", ["list", "--app", "--columns=name,application,version"], cancellationToken);
+            var apps = ParseFlatpakListOutput(output);
+            _logger.LogInformation("Flatpak inventory resolved {Count} package(s)", apps.Count);
+            return apps;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Flatpak inventory skipped because flatpak was unavailable or failed");
+            return [];
+        }
     }
 
     // FIX #11: accept string[] arguments so they are never shell-interpolated

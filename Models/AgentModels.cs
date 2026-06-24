@@ -35,6 +35,7 @@ public sealed record AgentTask(
     string? PackageScope,
     string? ProductCode,
     string? SourceUrl,
+    string? ManagementSourceUrl,
     string? Sha256,
     string? InstallArgs,
     string? TargetVersion,

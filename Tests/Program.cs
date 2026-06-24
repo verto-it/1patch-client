@@ -92,6 +92,21 @@ openssl|3.0.13-0ubuntu3.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.c
 Expect(dpkgApps.Count == 2, "dpkg parser should return two packages");
 Expect(dpkgApps[0].Name == "apt" && dpkgApps[0].PackageId == "apt", "dpkg parser should use package name as packageId");
 
+var snapApps = PlatformPackageProvider.ParseSnapListOutput("""
+Name      Version  Rev   Tracking       Publisher   Notes
+code      1.99.3   192   latest/stable  vscode✓     classic
+spotify   1.2.60   82    latest/stable  spotify✓    -
+""");
+Expect(snapApps.Count == 2, "Snap parser should return installed snap rows");
+Expect(snapApps[0].PackageManager == "snap" && snapApps[0].PackageId == "code", "Snap parser should stamp manager metadata");
+
+var flatpakApps = PlatformPackageProvider.ParseFlatpakListOutput("""
+Bitwarden	com.bitwarden.desktop	2025.4.1
+VLC	org.videolan.VLC	3.0.20
+""");
+Expect(flatpakApps.Count == 2, "Flatpak parser should return installed app rows");
+Expect(flatpakApps[0].PackageManager == "flatpak" && flatpakApps[0].PackageId == "com.bitwarden.desktop", "Flatpak parser should stamp manager metadata");
+
 var wingetMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 PlatformPackageProvider.ParseWingetListInto("""
 Name           Id             Version
@@ -148,6 +163,20 @@ Expect(nonRootResult.Contains("run as root", StringComparison.OrdinalIgnoreCase)
 var missingAptResult = await LinuxProvider(new RecordingRunner(new Win32Exception("not found")), isRoot: true)
     .UpdateAsync(UpdateTask(packageId: "openssl"), CancellationToken.None);
 Expect(missingAptResult.Contains("apt-get was not found", StringComparison.OrdinalIgnoreCase), "linux update should report missing apt-get");
+
+var snapRunner = new RecordingRunner(new ProcessResult(0, "snap refreshed"));
+var snapResult = await LinuxProvider(snapRunner, isRoot: true)
+    .UpdateAsync(UpdateTask(packageId: "code", packageManager: "snap"), CancellationToken.None);
+Expect(snapResult == "snap refreshed", "linux snap update should return command output on success");
+Expect(snapRunner.Calls[0].FileName == "snap", "linux snap update should call snap");
+Expect(snapRunner.Calls[0].Arguments.SequenceEqual(["refresh", "code"]), "linux snap update should pass exact refresh arguments");
+
+var flatpakRunner = new RecordingRunner(new ProcessResult(0, "flatpak updated"));
+var flatpakResult = await LinuxProvider(flatpakRunner, isRoot: true)
+    .UpdateAsync(UpdateTask(packageId: "org.videolan.VLC", packageManager: "flatpak"), CancellationToken.None);
+Expect(flatpakResult == "flatpak updated", "linux flatpak update should return command output on success");
+Expect(flatpakRunner.Calls[0].FileName == "flatpak", "linux flatpak update should call flatpak");
+Expect(flatpakRunner.Calls[0].Arguments.SequenceEqual(["update", "-y", "org.videolan.VLC"]), "linux flatpak update should pass exact update arguments");
 
 var chocoRunner = new RecordingRunner(new ProcessResult(0, "upgraded"));
 var chocoResult = await WindowsProvider(chocoRunner).UpdateAsync(UpdateTask("git", packageManager: "chocolatey"), CancellationToken.None);

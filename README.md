@@ -12,7 +12,7 @@ C# .NET 9 worker service for Windows and Linux. Enrolls with the management serv
 - A running 1Patch Management Server with at least one backend node online
 - A client enrollment token (created on the management server)
 - Windows clients: install whichever managers you want 1Patch to use (`winget`, Chocolatey, or Scoop)
-- Linux clients: Ubuntu/Debian-compatible host with `dpkg-query` and `apt-get`
+- Linux clients: Ubuntu/Debian-compatible host with `dpkg-query` and `apt-get`; optional `snap` and `flatpak` support is used when those tools are installed
 
 ---
 
@@ -131,7 +131,7 @@ Start
                    ├─ Verify task source URL is in TrustedDownloadHosts
                    ├─ Download package
                    ├─ Verify SHA-256 hash
-                   └─ Execute via platform provider (winget / Chocolatey / Scoop / apt)
+                   └─ Execute via platform provider (winget / Chocolatey / Scoop / apt / Snap / Flatpak)
 ```
 
 ---
@@ -162,11 +162,11 @@ The private key is never exposed through a public property or included in any lo
 | Platform | Inventory | Package execution |
 |---|---|---|
 | Windows | Registry, `winget list`, `choco list --limit-output`, Scoop app roots | `winget upgrade`, `choco upgrade`, `scoop update` |
-| Linux | `dpkg-query` | `apt-get install --only-upgrade` |
+| Linux | `dpkg-query`, optional `snap list`, optional `flatpak list` | `apt-get install --only-upgrade`, `snap refresh`, `flatpak update` |
 
 Scoop packages installed under individual user profiles are reported in inventory with `packageScope: user`, but update tasks for those packages are rejected in this release. Global and service-account-visible Scoop installs can be updated.
 
-Linux support in v1 is intentionally limited to repo-managed Ubuntu/Debian `apt` packages. Linux tasks must provide a safe `packageId` from inventory or an `apt` package artifact. Downloaded `.deb` packages, scripts, rpm/dnf, and zypper are not executed by the client yet.
+Linux package tasks must provide a safe `packageId` from inventory or the catalog. Downloaded `.deb` packages, scripts, rpm/dnf, pacman, and zypper are not executed by the client yet.
 
 ---
 
@@ -219,4 +219,4 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now 1patch-client
 ```
 
-The service must run as root for Linux package updates because `apt-get install --only-upgrade` requires elevated privileges. Inventory collection can run without root, but update tasks will be rejected until the service has package-manager privileges.
+The service must run as root for Linux package updates because `apt-get`, `snap refresh`, and system Flatpak updates require elevated privileges. Inventory collection can run without root, but update tasks will be rejected until the service has package-manager privileges.

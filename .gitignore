@@ -1,6 +1,15 @@
 # Device identity contains a DPAPI-protected private key — must never be committed
 device.identity.json
 
+# Environment / local secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+*.log
 
 # Build output
 bin/
